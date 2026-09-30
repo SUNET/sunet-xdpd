@@ -1,0 +1,30 @@
+{
+  "interfaces": {
+    "lo": {
+      "bpf_drop_filters": [
+        {
+          "description": "Drop some TCP",
+          "expr": "tcp dst port 1337"
+        },
+        {
+          "description": "Drop some UDP",
+          "expr": "udp dst port 9999",
+          "monitor": true
+        }
+      ]
+    },
+    "ens3": {
+      "bpf_drop_filters": [
+        {
+          "description": "Drop some TCP",
+          "expr": "tcp dst port 1338"
+        },
+        {
+          "description": "Drop some UDP",
+          "expr": "udp dst port 9998",
+          "monitor": true
+        }
+      ]
+    }
+  }
+}
