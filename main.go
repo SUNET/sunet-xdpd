@@ -44,6 +44,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -78,6 +79,8 @@ const (
 	// cbpfc filters return 0 if the filter did not match the packet.
 	noFilterMatch = 0
 )
+
+var version = "dev" // overridden via -ldflags "-X main.version=..."
 
 type xdpd struct {
 	confPath       string
@@ -166,7 +169,10 @@ func main() {
 	configFlag := flag.String("config", "sunet-xdpd.json", "config file")
 	flag.Parse()
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil)).With(
+		slog.String("version", version),
+		slog.String("go_version", runtime.Version()),
+	)
 
 	xd, err := newXdpd(*configFlag, logger)
 	if err != nil {
