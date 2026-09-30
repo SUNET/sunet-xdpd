@@ -551,9 +551,10 @@ func (xd *xdpd) loadFilters() (err error) {
 // filtering outlives this process.
 func (f *filter) attach(logger *slog.Logger, iface *net.Interface, prog *ebpf.Program) error {
 	logger.Info("attach()", "iface", iface.Name)
-	l, err := link.LoadPinnedLink(f.linkPin, nil)
-	switch {
-	case err == nil:
+	detachedLinkUnpinned := false
+
+	l, loadErr := link.LoadPinnedLink(f.linkPin, nil)
+	if loadErr == nil {
 		info, err := l.Info()
 		if err != nil {
 			cErr := l.Close()
@@ -576,47 +577,53 @@ func (f *filter) attach(logger *slog.Logger, iface *net.Interface, prog *ebpf.Pr
 			// file but it does not actually reference the interface it once
 			// did anymore.
 			if xdp.Ifindex == 0 {
-				logger.Warn("found detached link file, unpinning it")
+				logger.Warn("found detached link file, unpinning it", "link_pin", f.linkPin)
 				err := l.Unpin()
 				if err != nil {
 					logger.Error("failed unpinning detached link file", "link_pin", f.linkPin, "error", err.Error())
 				}
+				detachedLinkUnpinned = true
+			} else {
+				return fmt.Errorf("%s is attached to a different interface; unload it first", f.linkPin)
 			}
-
-			return fmt.Errorf("%s is attached to a different interface; unload it first", f.linkPin)
-		}
-		logger.Info("updating existing pin", "iface", iface.Name, "link_pin", f.linkPin)
-		if err := l.Update(prog); err != nil {
-			cErr := l.Close()
-			if cErr != nil {
-				logger.Error("link close failed after update failed", "link_pin", f.linkPin, "error", err.Error())
-			}
-			return fmt.Errorf("replacing running program: %w", err)
-		}
-		f.tookOver = true
-
-	case errors.Is(err, os.ErrNotExist):
-		logger.Info("link is missing, attaching XDP", "iface", iface.Name)
-		l, err = link.AttachXDP(link.XDPOptions{Program: prog, Interface: f.iface.Index})
-		if err != nil {
-			// If we fail here the error message can be fairly opaque, a tip is to check dmesg, e.g. I have seen:
-			// "failed to attach link: create link: invalid argument" which turned up in dmesg like so:
-			// ===
-			// virtio_net virtio1 ens3: single-buffer XDP requires MTU less than 3506
-			// ===
-			return fmt.Errorf("attaching XDP for %s: %w", iface.Name, err)
-		}
-		logger.Info("creating pin", "iface", iface.Name, "link_pin", f.linkPin)
-		if err := l.Pin(f.linkPin); err != nil {
-			cErr := l.Close() // not pinned yet, so this detaches again
-			if cErr != nil {
-				logger.Error("closing pin %s failed after failed pin", "link_pin", f.linkPin, "error", err.Error())
-			}
-			return fmt.Errorf("pinning link: %w", err)
 		}
 
-	default:
-		return fmt.Errorf("opening pinned link: %w", err)
+		if !detachedLinkUnpinned {
+			logger.Info("updating existing pin", "iface", iface.Name, "link_pin", f.linkPin)
+			if err := l.Update(prog); err != nil {
+				cErr := l.Close()
+				if cErr != nil {
+					logger.Error("link close failed after update failed", "link_pin", f.linkPin, "error", err.Error())
+				}
+				return fmt.Errorf("replacing running program: %w", err)
+			}
+			f.tookOver = true
+		}
+	}
+
+	if loadErr != nil || detachedLinkUnpinned {
+		if errors.Is(loadErr, os.ErrNotExist) || detachedLinkUnpinned {
+			logger.Info("link is missing, attaching XDP", "iface", iface.Name)
+			l, err := link.AttachXDP(link.XDPOptions{Program: prog, Interface: f.iface.Index})
+			if err != nil {
+				// If we fail here the error message can be fairly opaque, a tip is to check dmesg, e.g. I have seen:
+				// "failed to attach link: create link: invalid argument" which turned up in dmesg like so:
+				// ===
+				// virtio_net virtio1 ens3: single-buffer XDP requires MTU less than 3506
+				// ===
+				return fmt.Errorf("attaching XDP for %s: %w", iface.Name, err)
+			}
+			logger.Info("creating pin", "iface", iface.Name, "link_pin", f.linkPin)
+			if err := l.Pin(f.linkPin); err != nil {
+				cErr := l.Close() // not pinned yet, so this detaches again
+				if cErr != nil {
+					logger.Error("closing pin %s failed after failed pin", "link_pin", f.linkPin, "error", err.Error())
+				}
+				return fmt.Errorf("pinning link: %w", err)
+			}
+		} else {
+			return fmt.Errorf("opening pinned link: %w", loadErr)
+		}
 	}
 
 	f.link = l
