@@ -585,6 +585,7 @@ func (f *filter) attach(logger *slog.Logger, iface *net.Interface, prog *ebpf.Pr
 
 			return fmt.Errorf("%s is attached to a different interface; unload it first", f.linkPin)
 		}
+		logger.Info("updating existing pin", "iface", iface.Name, "link_pin", f.linkPin)
 		if err := l.Update(prog); err != nil {
 			cErr := l.Close()
 			if cErr != nil {
@@ -619,7 +620,6 @@ func (f *filter) attach(logger *slog.Logger, iface *net.Interface, prog *ebpf.Pr
 	}
 
 	f.link = l
-	logger.Info("pin was created", "iface", iface.Name, "link_pin", f.linkPin)
 	return nil
 }
 
