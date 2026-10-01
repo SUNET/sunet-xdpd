@@ -17,11 +17,14 @@ jobs:
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
 
+      - name: Set release version
+        run: echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV" # v1.0.0 -> 1.0.0
+
       - name: Build
         run: |
           docker buildx build \
             --platform linux/amd64,linux/arm64 \
-            --build-arg VERSION="${GITHUB_REF_NAME}" \
+            --build-arg VERSION="${RELEASE_VERSION}" \
             -o dist .
 
       - name: Package
@@ -29,7 +32,7 @@ jobs:
           mkdir release
           for dir in dist/linux_*; do
             platform="${dir#dist/}" # e.g. linux_amd64
-            tar -C "$dir" -czf "release/sunet-xdpd_${GITHUB_REF_NAME}_${platform}.tar.gz" sunet-xdpd
+            tar -C "$dir" -czf "release/sunet-xdpd_${RELEASE_VERSION}_${platform}.tar.gz" sunet-xdpd
           done
           cd release && sha256sum *.tar.gz > SHA256SUMS
 
