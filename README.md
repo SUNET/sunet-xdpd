@@ -1,6 +1,6 @@
 # sunet-xdpd
 
-This is a daemon that reads a config file that describes BPF (tcpdump) filter
+This is a daemon that reads config files that describe BPF (tcpdump) filter
 expressions that should be applied to a network interface via XDP, and when the
 filter is matched the matching packet is dropped.
 
@@ -32,6 +32,38 @@ available at 127.0.0.1:2112/metrics, e.g.:
 ```
 curl http://127.0.0.1:2112/metrics | grep ^filter
 ```
+
+## Configuration
+The config is read from every `*.json` file in the directory given by
+`-config-dir` (default `/etc/sunet-xdpd/conf.d`), and the filters for an
+interface are appended across files. This way separate processes can each own a
+file, for example:
+```
+/etc/sunet-xdpd/conf.d/00-base.json   # from config management
+/etc/sunet-xdpd/conf.d/50-ddos.json   # from a DDoS mitigation tool
+```
+
+See [conf.d.sample](conf.d.sample) for the file format. The rules are:
+
+* Files are read in name order, sorted as strings, so `10-x.json` comes before
+  `9-x.json`. Names starting with `.`, other suffixes and directories are
+  skipped.
+* To change a file, write a temporary file starting with `.` in the same
+  directory and rename it into place, so a half written file is never read.
+  Then reload with `pkill -HUP sunet-xdpd`, once all files of a change are in
+  place.
+* A reload is all or nothing: if any file is broken (invalid JSON, an unknown
+  field or one given twice, a missing or empty `expr`, an expression that
+  doesn't compile) nothing changes and the error, naming the file, is logged.
+  A broken file from one writer blocks changes from all of them until it is
+  fixed.
+* Two filters on one interface with the same description, expr and monitor
+  setting are an error, also when they are in different files.
+* Removing a file removes its filters on the next reload. A directory without
+  `*.json` files is an error rather than detaching every filter, so to run
+  without filters use a file containing `{}`, or `sunet-xdpd -unload`.
+* The log line after a load or reload lists the files that were read and how
+  many filters each added.
 
 ## Building
 The Dockerfile is not meant for creating a container, rather it is a way to

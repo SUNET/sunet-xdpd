@@ -1,0 +1,13 @@
+{
+  "interfaces": {
+    "ens3": {
+      "bpf_drop_filters": [
+        {
+          "description": "Monitor a suspected NTP reflection flood",
+          "expr": "udp src port 123 and len > 400",
+          "monitor": true
+        }
+      ]
+    }
+  }
+}
