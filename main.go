@@ -827,12 +827,6 @@ func buildProgramAndCounters(logger *slog.Logger, iface *net.Interface, linkType
 		Instructions: insns,
 	}
 
-	// Fix e.g. "ens3: single-buffer XDP requires MTU less than 3506" on interfaces with a large MTU.
-	// I noticed the program will fail to load if this is used on "lo" so skip that interface
-	if iface.Name != "lo" {
-		progSpec.Flags = unix.BPF_F_XDP_HAS_FRAGS
-	}
-
 	prog, err := ebpf.NewProgram(progSpec)
 	if err != nil {
 		// The verifier log is the key to debugging hand-built programs,
