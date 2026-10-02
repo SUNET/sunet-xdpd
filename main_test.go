@@ -277,9 +277,34 @@ func TestOnlyDropFilters(t *testing.T) {
 	}
 }
 
+// writeConfDir creates a config directory holding files (name -> content).
+func writeConfDir(t *testing.T, files map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+const goodConf = `{"interfaces": {"lo": {"bpf_drop_filters": [{"description": "Drop some UDP port 9999", "expr": "udp dst port 9999"}]}}}`
+
+func wantInterfaces(t *testing.T, conf config, want map[string][]bpfDropFilter) {
+	t.Helper()
+	got := map[string][]bpfDropFilter{}
+	for ifname, ifConf := range conf.Interfaces {
+		got[ifname] = ifConf.BPFDropFilters
+	}
+	if !maps.EqualFunc(got, want, slices.Equal) {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+}
+
 func TestReadConfig(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.json")
-	content := `
+	dir := writeConfDir(t, map[string]string{
+		"00-base.json": `
 {
   "interfaces": {
     "lo": {
@@ -300,49 +325,46 @@ func TestReadConfig(t *testing.T) {
         {
           "description": "Drop some TCP port 1337",
           "expr": "tcp dst port 1337"
-        },
-        {
-          "description": "Monitor some UDP port 9998",
-          "expr": "udp dst port 9998",
-          "monitor": true
         }
       ]
     }
   }
 }
-`
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		t.Fatal(err)
-	}
+`,
+		"50-ddos.json": `
+{
+  "interfaces": {
+    "lo": {
+      "bpf_drop_filters": [
+        {
+          "description": "Drop a flood",
+          "expr": "udp dst port 4444"
+        }
+      ]
+    }
+  }
+}
+`,
+	})
 
-	conf, err := readConf(path)
+	conf, err := readConf(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	want := map[string][]bpfDropFilter{
+	// Filters for one interface are appended in file name order.
+	wantInterfaces(t, conf, map[string][]bpfDropFilter{
 		"lo": {
-			{Description: "Drop some UDP port 9999", Expr: "udp dst port 9999"},
-			{Description: "Monitor some large DNS responses", Expr: "udp src port 53 and len > 1000", Monitor: true},
+			{Description: "Drop some UDP port 9999", Expr: "udp dst port 9999", source: "00-base.json"},
+			{Description: "Monitor some large DNS responses", Expr: "udp src port 53 and len > 1000", Monitor: true, source: "00-base.json"},
+			{Description: "Drop a flood", Expr: "udp dst port 4444", source: "50-ddos.json"},
 		},
 		"ens3": {
-			{Description: "Drop some TCP port 1337", Expr: "tcp dst port 1337"},
-			{Description: "Monitor some UDP port 9998", Expr: "udp dst port 9998", Monitor: true},
+			{Description: "Drop some TCP port 1337", Expr: "tcp dst port 1337", source: "00-base.json"},
 		},
-	}
-	if len(conf.Interfaces) != len(want) {
-		t.Fatalf("got %d interface, want %d", len(conf.Interfaces), len(want))
-	}
-
-	for wantIfname, wantBFDFilters := range want {
-		if _, found := conf.Interfaces[wantIfname]; !found {
-			t.Fatalf("unable to find expcted interface name: %s", wantIfname)
-		}
-		for i, wantBFDFilter := range wantBFDFilters {
-			if conf.Interfaces[wantIfname].BPFDropFilters[i] != wantBFDFilter {
-				t.Errorf("filter %d: got %+v, want %+v", i, conf.Interfaces[wantIfname].BPFDropFilters[i], wantBFDFilter)
-			}
-		}
+	})
+	if want := []string{"00-base.json", "50-ddos.json"}; !slices.Equal(conf.files, want) {
+		t.Errorf("files: got %v, want %v", conf.files, want)
 	}
 }
 
@@ -380,19 +402,181 @@ func TestLinkTypeFor(t *testing.T) {
 	}
 }
 
-func TestReadConfigInvalid(t *testing.T) {
-	dir := t.TempDir()
-
-	if _, err := readConf(filepath.Join(dir, "missing.json")); err == nil {
-		t.Error("expected an error for a missing file")
-	}
-
-	bad := filepath.Join(dir, "bad.json")
-	if err := os.WriteFile(bad, []byte(`{"interfaces": {`), 0o600); err != nil {
+// Temp files written before a rename, editor and package manager leftovers,
+// other suffixes and directories are not config, even when they look broken.
+func TestReadConfigIgnores(t *testing.T) {
+	broken := `{"interfaces": {`
+	dir := writeConfDir(t, map[string]string{
+		"00-base.json":          goodConf,
+		".50-ddos.json.tmp":     broken,
+		".50-ddos.json.swp":     broken,
+		".hidden.json":          broken,
+		"50-ddos.json~":         broken,
+		"50-ddos.json.bak":      broken,
+		"50-ddos.json.dpkg-old": broken,
+		"README":                broken,
+	})
+	if err := os.Mkdir(filepath.Join(dir, "sub.json"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readConf(bad); err == nil {
-		t.Error("expected an error for broken JSON")
+	if err := os.WriteFile(filepath.Join(dir, "sub.json", "inner.json"), []byte(broken), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	conf, err := readConf(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"00-base.json"}; !slices.Equal(conf.files, want) {
+		t.Errorf("files: got %v, want %v", conf.files, want)
+	}
+}
+
+// Names are sorted as strings, not numbers, as documented.
+func TestReadConfigOrderIsByName(t *testing.T) {
+	dir := writeConfDir(t, map[string]string{
+		"9-a.json":  `{"interfaces": {"lo": {"bpf_drop_filters": [{"description": "a", "expr": "udp dst port 1"}]}}}`,
+		"10-b.json": `{"interfaces": {"lo": {"bpf_drop_filters": [{"description": "b", "expr": "udp dst port 2"}]}}}`,
+	})
+	conf, err := readConf(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantInterfaces(t, conf, map[string][]bpfDropFilter{
+		"lo": {
+			{Description: "b", Expr: "udp dst port 2", source: "10-b.json"},
+			{Description: "a", Expr: "udp dst port 1", source: "9-a.json"},
+		},
+	})
+}
+
+func TestReadConfigSymlinks(t *testing.T) {
+	// To a file in the directory: read, under the link's name.
+	dir := writeConfDir(t, map[string]string{"base.conf": goodConf})
+	if err := os.Symlink("base.conf", filepath.Join(dir, "00-base.json")); err != nil {
+		t.Fatal(err)
+	}
+	conf, err := readConf(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"00-base.json"}; !slices.Equal(conf.files, want) {
+		t.Errorf("files: got %v, want %v", conf.files, want)
+	}
+
+	// Out of the directory: the whole read fails.
+	outside := filepath.Join(t.TempDir(), "outside.json")
+	if err := os.WriteFile(outside, []byte(goodConf), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dir = writeConfDir(t, map[string]string{"00-base.json": goodConf})
+	if err := os.Symlink(outside, filepath.Join(dir, "50-outside.json")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readConf(dir); err == nil || !strings.Contains(err.Error(), "50-outside.json") {
+		t.Errorf("got %v, want an error about 50-outside.json", err)
+	}
+}
+
+// An interface without filters in one file doesn't affect its filters from
+// another, and one that only appears without filters is still configured.
+// A file with just {} is fine and adds nothing.
+func TestReadConfigEmptyInterface(t *testing.T) {
+	dir := writeConfDir(t, map[string]string{
+		"00-base.json":  `{"interfaces": {"lo": {}}}`,
+		"50-ddos.json":  goodConf,
+		"60-ens3.json":  `{"interfaces": {"ens3": {"bpf_drop_filters": []}}}`,
+		"70-empty.json": `{}`,
+	})
+	conf, err := readConf(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantInterfaces(t, conf, map[string][]bpfDropFilter{
+		"lo":   {{Description: "Drop some UDP port 9999", Expr: "udp dst port 9999", source: "50-ddos.json"}},
+		"ens3": nil,
+	})
+	if want := []string{"00-base.json", "50-ddos.json", "60-ens3.json", "70-empty.json"}; !slices.Equal(conf.files, want) {
+		t.Errorf("files: got %v, want %v", conf.files, want)
+	}
+}
+
+func TestReadConfigDuplicateAcrossFiles(t *testing.T) {
+	dir := writeConfDir(t, map[string]string{
+		"00-base.json": goodConf,
+		"50-ddos.json": goodConf,
+	})
+	conf, err := readConf(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `lo: filter "Drop some UDP port 9999" in 50-ddos.json duplicates the one in 00-base.json`
+	if err := conf.validate(); err == nil || err.Error() != want {
+		t.Errorf("got %v, want %q", err, want)
+	}
+}
+
+func TestConfigFileCounts(t *testing.T) {
+	dir := writeConfDir(t, map[string]string{
+		"00-base.json": `{"interfaces": {
+			"lo": {"bpf_drop_filters": [{"description": "a", "expr": "udp dst port 1"}]},
+			"ens3": {"bpf_drop_filters": [{"description": "b", "expr": "udp dst port 2"}]}
+		}}`,
+		"50-ddos.json":  goodConf,
+		"60-empty.json": `{}`,
+	})
+	conf, err := readConf(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int{"00-base.json": 2, "50-ddos.json": 1, "60-empty.json": 0}
+	if got := conf.fileCounts(); !maps.Equal(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestReadConfigInvalid(t *testing.T) {
+	if _, err := readConf(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Error("expected an error for a missing directory")
+	}
+
+	for _, tc := range []struct {
+		name  string
+		files map[string]string
+		want  string
+	}{
+		{"no json files", map[string]string{"README": "x", ".00-base.json.tmp": goodConf}, "no *.json config files in "},
+		{"broken json", map[string]string{"00-base.json": goodConf, "50-ddos.json": `{"interfaces": {`}, "parsing 50-ddos.json: "},
+		{"zero bytes", map[string]string{"50-ddos.json": ""}, "parsing 50-ddos.json: jsontext: unexpected EOF"},
+		{"unknown top level field", map[string]string{"50-ddos.json": `{"interface": {}}`}, `unknown object member name "interface"`},
+		{"typo in a filter", map[string]string{"50-ddos.json": `{"interfaces": {"lo": {"bpf_drop_filters": [{"description": "d", "expr": "udp", "monitr": true}]}}}`}, `unknown object member name "monitr" within "/interfaces/lo/bpf_drop_filters/0"`},
+		// v1 matched names ignoring case; v2 doesn't, so this is an unknown field.
+		{"wrong case", map[string]string{"50-ddos.json": `{"interfaces": {"lo": {"bpf_drop_filters": [{"description": "d", "expr": "udp", "Monitor": true}]}}}`}, `unknown object member name "Monitor"`},
+		{"field twice in a filter", map[string]string{"50-ddos.json": `{"interfaces": {"lo": {"bpf_drop_filters": [{"description": "d", "expr": "udp", "expr": "tcp"}]}}}`}, `duplicate object member name "expr"`},
+		// v1 would silently keep only the last one, losing the first one's filters.
+		{"interface twice in a file", map[string]string{"50-ddos.json": `{"interfaces": {"lo": {}, "lo": {}}}`}, `duplicate object member name "lo" within "/interfaces"`},
+		{"trailing data", map[string]string{"50-ddos.json": `{} {}`}, "parsing 50-ddos.json: jsontext: invalid character '{' after top-level value"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := readConf(writeConfDir(t, tc.files))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("got %v, want an error containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// The sample directory stays loadable as the docs point at it.
+func TestSampleConfig(t *testing.T) {
+	conf, err := readConf("conf.d.sample")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conf.validate(); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"00-base.json", "50-ddos.json"}; !slices.Equal(conf.files, want) {
+		t.Errorf("files: got %v, want %v", conf.files, want)
 	}
 }
 
@@ -442,7 +626,7 @@ func newTestXdpd(t *testing.T) (*xdpd, string) {
 	}
 
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	xd := newXdpd("unused.json", pinDir, logger)
+	xd := newXdpd("unused", pinDir, logger)
 	t.Cleanup(func() {
 		if err := unloadAll(logger, pinDir); err != nil {
 			t.Error("unloadAll:", err)
@@ -471,7 +655,7 @@ func liveProg(t *testing.T, f *filter) (link.ID, ebpf.ProgramID) {
 }
 
 func TestApplyFailsOnMissingInterface(t *testing.T) {
-	xd := newXdpd("unused.json", t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	xd := newXdpd("unused", t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	err := xd.apply(config{Interfaces: map[string]interfaceConfig{"does-not-exist0": {}}})
 	if err == nil {
@@ -581,7 +765,7 @@ func TestApplyTakesOverPinnedLink(t *testing.T) {
 	}
 	linkID, _ := liveProg(t, first.filters[ifname])
 
-	second := newXdpd("unused.json", first.pinDir, first.logger)
+	second := newXdpd("unused", first.pinDir, first.logger)
 	if err := second.apply(confFor(ifname, bpfDropFilter{Description: "two", Expr: "udp dst port 9998"})); err != nil {
 		t.Fatal(err)
 	}
@@ -949,7 +1133,7 @@ func TestApplyBadConfigKeepsHookPinsFromPreviousRun(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	second := newXdpd("unused.json", first.pinDir, first.logger)
+	second := newXdpd("unused", first.pinDir, first.logger)
 	if err := second.apply(confFor(ifname, bpfDropFilter{Description: "bad", Expr: "this is ((not a filter"})); err == nil {
 		t.Fatal("expected an error for an invalid expression")
 	}
@@ -976,7 +1160,7 @@ func TestApplyRollsBackTakeover(t *testing.T) {
 	linkID, progID := liveProg(t, first.filters[ifA])
 
 	// A new process: A is taken over and swapped, then B fails.
-	second := newXdpd("unused.json", first.pinDir, first.logger)
+	second := newXdpd("unused", first.pinDir, first.logger)
 	err := second.apply(config{Interfaces: map[string]interfaceConfig{
 		ifA: {BPFDropFilters: []bpfDropFilter{one, {Description: "two", Expr: "udp dst port 9998"}}},
 		ifB: {BPFDropFilters: []bpfDropFilter{one}},
@@ -1071,7 +1255,7 @@ func TestApplyTracksSwapThatCouldNotBePutBack(t *testing.T) {
 func TestRemovedPinWithoutFilters(t *testing.T) {
 	pinDir := t.TempDir()
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	xd := newXdpd("unused.json", pinDir, logger)
+	xd := newXdpd("unused", pinDir, logger)
 
 	if pin := xd.removedPin(); pin != "" {
 		t.Fatalf("%s reported as removed before anything was unloaded", pin)
@@ -1133,7 +1317,7 @@ func TestApplyRemovesOrphans(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	second := newXdpd("unused.json", first.pinDir, first.logger)
+	second := newXdpd("unused", first.pinDir, first.logger)
 	if err := second.apply(config{}); err != nil {
 		t.Fatal(err)
 	}
@@ -1170,8 +1354,8 @@ func TestPinOwner(t *testing.T) {
 }
 
 func TestConfigValidateDuplicates(t *testing.T) {
-	one := bpfDropFilter{Description: "one", Expr: "udp dst port 9999"}
-	monitorOne := bpfDropFilter{Description: "one", Expr: "udp dst port 9999", Monitor: true}
+	one := bpfDropFilter{Description: "one", Expr: "udp dst port 9999", source: "00-base.json"}
+	monitorOne := bpfDropFilter{Description: "one", Expr: "udp dst port 9999", Monitor: true, source: "00-base.json"}
 
 	if err := confFor("eth0", one, monitorOne).validate(); err != nil {
 		t.Errorf("drop and monitor versions of one filter: %v", err)
@@ -1183,15 +1367,65 @@ func TestConfigValidateDuplicates(t *testing.T) {
 		t.Errorf("one filter on two interfaces: %v", err)
 	}
 
+	// In one file.
 	err := confFor("eth0", one, monitorOne, one).validate()
-	if err == nil || !strings.Contains(err.Error(), "filters 0 and 2") {
-		t.Errorf("got %v, want an error about filters 0 and 2", err)
+	want := `eth0: filter "one" in 00-base.json duplicates the one in 00-base.json`
+	if err == nil || err.Error() != want {
+		t.Errorf("got %v, want %q", err, want)
+	}
+
+	// Across files: an error too, naming both.
+	fromTool := one
+	fromTool.source = "50-ddos.json"
+	err = confFor("eth0", one, fromTool).validate()
+	want = `eth0: filter "one" in 50-ddos.json duplicates the one in 00-base.json`
+	if err == nil || err.Error() != want {
+		t.Errorf("got %v, want %q", err, want)
 	}
 
 	// apply refuses it before it gets anywhere near the kernel.
-	xd := newXdpd("unused.json", t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if err := xd.apply(confFor("does-not-exist0", one, one)); err == nil || !strings.Contains(err.Error(), "same description") {
+	xd := newXdpd("unused", t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := xd.apply(confFor("does-not-exist0", one, one)); err == nil || !strings.Contains(err.Error(), "duplicates") {
 		t.Errorf("got %v, want the duplicate to be refused", err)
+	}
+}
+
+// An empty expr compiles to "match everything", so a drop filter without one
+// (e.g. from a generator with an empty template variable) would drop all
+// traffic on the interface.
+func TestConfigValidateEmptyExpr(t *testing.T) {
+	for _, expr := range []string{"", " \t\n"} {
+		bdf := bpfDropFilter{Description: "flood", Expr: expr, source: "50-ddos.json"}
+		want := `eth0: filter "flood" in 50-ddos.json has an empty expr`
+		if err := confFor("eth0", bdf).validate(); err == nil || err.Error() != want {
+			t.Errorf("expr %q: got %v, want %q", expr, err, want)
+		}
+	}
+
+	// A missing expr, or a null entry in the list, ends up the same.
+	for _, content := range []string{
+		`{"interfaces": {"lo": {"bpf_drop_filters": [{"description": "flood"}]}}}`,
+		`{"interfaces": {"lo": {"bpf_drop_filters": [null]}}}`,
+	} {
+		conf, err := readConf(writeConfDir(t, map[string]string{"50-ddos.json": content}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := conf.validate(); err == nil || !strings.Contains(err.Error(), "in 50-ddos.json has an empty expr") {
+			t.Errorf("%s: got %v, want an empty expr error", content, err)
+		}
+	}
+}
+
+// A filter that doesn't compile names the file it came from, so the writer
+// that broke a reload can be found.
+func TestBuildProgramErrorNamesSource(t *testing.T) {
+	bad := []bpfDropFilter{{Description: "Block flood", Expr: "not a filter", source: "50-ddos.json"}}
+	// Fails on the first filter, before any of the (nil) maps are used.
+	_, err := buildProgram(bad, dltEthernet, nil, nil, nil)
+	want := `50-ddos.json: "Block flood": compiling "not a filter": `
+	if err == nil || !strings.HasPrefix(err.Error(), want) {
+		t.Errorf("got %v, want an error starting with %q", err, want)
 	}
 }
 

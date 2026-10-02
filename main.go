@@ -1,8 +1,8 @@
 // As this code interacts with XDP it is only usable on linux
 //go:build linux
 
-// sunet-xdpd reads bpf (tcpdump) filter expressions from a config file and creates
-// a XDP program that drops matching packets per interface.
+// sunet-xdpd reads bpf (tcpdump) filter expressions from a directory of config
+// files and creates a XDP program that drops matching packets per interface.
 //
 // The XDP link is pinned so filtering keeps running when sunet-xdpd exits,
 // crashes or restarts. On startup, sunet-xdpd takes over the running filter
@@ -10,17 +10,30 @@
 //
 //	sunet-xdpd -unload
 //
+// The config is read from the *.json files in -config-dir (default
+// /etc/sunet-xdpd/conf.d), sorted by name as strings, so 10-x.json comes
+// before 9-x.json. Names starting with "." are skipped, as are other suffixes
+// and directories, so a writer can write .50-ddos.json.tmp and rename it into
+// place. Each file looks like conf.d.sample/00-base.json and the filters for
+// an interface are appended across files, so separate processes can each own
+// a file, e.g. 00-base.json from config management and 50-<tool>.json per
+// tool. Unknown fields, names in the wrong case or given twice are an error,
+// as is a directory without *.json files: to run without filters use a file
+// containing {}, or -unload.
+//
 // Reload config with:
 //
 //	pkill -HUP sunet-xdpd
 //
-// A reload is all or nothing per run: if the config can't be read or any BPF
-// expression fails to compile or load, the error is logged and the filters that are
-// running are left as they are. Interfaces removed from the config are detached
-// and their pins removed, also on startup for interfaces that were removed while
-// sunet-xdpd wasn't running. That happens once the new config is running, so if
-// it fails the reload is still done: it is logged as a warning and tried again
-// on the next reload.
+// A reload is all or nothing per run: if any config file can't be read or any
+// BPF expression fails to compile or load, the error is logged and the filters
+// that are running are left as they are. So two filters on one interface with
+// the same description, expr and monitor setting fail it, also in different
+// files. Interfaces removed from the config are detached and their pins
+// removed, also on startup for interfaces that were removed while sunet-xdpd
+// wasn't running. That happens once the new config is running, so if it fails
+// the reload is still done: it is logged as a warning and tried again on the
+// next reload.
 //
 // Pins in /sys/fs/bpf/sunet-xdpd:
 //
@@ -42,11 +55,12 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"maps"
 	"math"
@@ -101,8 +115,8 @@ func pinPath(dir, ifname, kind string) string {
 }
 
 type xdpd struct {
-	confPath string
-	pinDir   string
+	confDir string
+	pinDir  string
 	// filters holds the running filters by interface name. It lives as long
 	// as the process (it is not rebuilt on reload) and is only touched from
 	// the goroutine running run().
@@ -122,6 +136,8 @@ type metricLabels struct {
 
 type config struct {
 	Interfaces map[string]interfaceConfig `json:"interfaces"`
+	// files are the config files that were read, in order.
+	files []string
 }
 
 type interfaceConfig struct {
@@ -132,12 +148,15 @@ type bpfDropFilter struct {
 	Description string `json:"description"`
 	Expr        string `json:"expr"`
 	Monitor     bool   `json:"monitor,omitempty"`
+	// source is the config file the filter was read from, for messages.
+	// Being unexported, encoding/json/v2 never reads or writes it.
+	source string
 }
 
-func newXdpd(confPath, pinDir string, logger *slog.Logger) *xdpd {
+func newXdpd(confDir, pinDir string, logger *slog.Logger) *xdpd {
 	reg := prometheus.NewRegistry()
 	return &xdpd{
-		confPath:       confPath,
+		confDir:        confDir,
 		pinDir:         pinDir,
 		filters:        map[string]*filter{},
 		logger:         logger,
@@ -149,29 +168,51 @@ func newXdpd(confPath, pinDir string, logger *slog.Logger) *xdpd {
 
 // validate checks what readConf can't. Filters on one interface with the same
 // description, expr and mode share their metric labels, which would mix up
-// their counts.
+// their counts. That holds across config files too, so writers must not reuse
+// each other's filters. An empty expr matches every packet, so a filter
+// without one, more likely a broken writer than intended, is refused rather
+// than dropping all traffic on the interface.
 func (c config) validate() error {
 	type key struct {
 		description, expr string
 		monitor           bool
 	}
 	for _, ifname := range slices.Sorted(maps.Keys(c.Interfaces)) {
-		seen := map[key]int{}
-		for i, bdf := range c.Interfaces[ifname].BPFDropFilters {
+		seen := map[key]bpfDropFilter{}
+		for _, bdf := range c.Interfaces[ifname].BPFDropFilters {
+			if strings.TrimSpace(bdf.Expr) == "" {
+				return fmt.Errorf("%s: filter %q in %s has an empty expr", ifname, bdf.Description, bdf.source)
+			}
 			k := key{bdf.Description, bdf.Expr, bdf.Monitor}
 			if first, ok := seen[k]; ok {
-				return fmt.Errorf("%s: filters %d and %d have the same description, expr and monitor setting", ifname, first, i)
+				return fmt.Errorf("%s: filter %q in %s duplicates the one in %s", ifname, bdf.Description, bdf.source, first.source)
 			}
-			seen[k] = i
+			seen[k] = bdf
 		}
 	}
 	return nil
 }
 
-// readConf reads and parses the config file. It has no side effects, so a
-// broken config can never leave the daemon half way between two configs.
-func readConf(path string) (conf config, err error) {
-	root, err := os.OpenRoot(filepath.Dir(path))
+// fileCounts returns how many filters each config file adds, for logging.
+func (c config) fileCounts() map[string]int {
+	counts := make(map[string]int, len(c.files))
+	for _, name := range c.files {
+		counts[name] = 0
+	}
+	for _, ifConf := range c.Interfaces {
+		for _, bdf := range ifConf.BPFDropFilters {
+			counts[bdf.source]++
+		}
+	}
+	return counts
+}
+
+// readConf reads the *.json files in dir in name order and appends their
+// filters per interface, see the package documentation for which files count.
+// It has no side effects, so a broken config can never leave the daemon half
+// way between two configs.
+func readConf(dir string) (conf config, err error) {
+	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return config{}, fmt.Errorf("readConf: unable to OpenRoot: %w", err)
 	}
@@ -182,14 +223,65 @@ func readConf(path string) (conf config, err error) {
 		}
 	}()
 
-	confBytes, err := root.ReadFile(filepath.Base(path))
+	// Sorted by name.
+	entries, err := fs.ReadDir(root.FS(), ".")
 	if err != nil {
-		return config{}, err
+		return config{}, fmt.Errorf("listing %s: %w", dir, err)
 	}
 
-	err = json.Unmarshal(confBytes, &conf)
+	conf.Interfaces = map[string]interfaceConfig{}
+	for _, e := range entries {
+		name := e.Name()
+		// Dotfiles are skipped so writers can write a temp file and rename it.
+		if strings.HasPrefix(name, ".") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		// Stat follows symlinks, but not out of root.
+		info, err := root.Stat(name)
+		if err != nil {
+			return config{}, fmt.Errorf("reading %s: %w", name, err)
+		}
+		if !info.Mode().IsRegular() {
+			continue
+		}
+
+		fileConf, err := readConfFile(root, name)
+		if err != nil {
+			return config{}, err
+		}
+		conf.files = append(conf.files, name)
+		for ifname, ifConf := range fileConf.Interfaces {
+			merged := conf.Interfaces[ifname]
+			for _, bdf := range ifConf.BPFDropFilters {
+				bdf.source = name
+				merged.BPFDropFilters = append(merged.BPFDropFilters, bdf)
+			}
+			conf.Interfaces[ifname] = merged
+		}
+	}
+
+	// Rather than an empty config, which would detach every filter.
+	if len(conf.files) == 0 {
+		return config{}, fmt.Errorf("no *.json config files in %s", dir)
+	}
+
+	return conf, nil
+}
+
+// readConfFile parses one config file. Unknown fields are an error, so a typo
+// like "monitr" can't silently turn a monitor filter into a drop filter. The
+// json/v2 defaults also refuse names in the wrong case, a name given twice
+// (like an interface, which would otherwise lose the first one's filters) and
+// anything after the JSON object.
+func readConfFile(root *os.Root, name string) (config, error) {
+	confBytes, err := root.ReadFile(name)
 	if err != nil {
-		return config{}, fmt.Errorf("parsing %s: %w", path, err)
+		return config{}, fmt.Errorf("reading %s: %w", name, err)
+	}
+
+	var conf config
+	if err := json.Unmarshal(confBytes, &conf, json.RejectUnknownMembers(true)); err != nil {
+		return config{}, fmt.Errorf("parsing %s: %w", name, err)
 	}
 
 	return conf, nil
@@ -197,7 +289,7 @@ func readConf(path string) (conf config, err error) {
 
 func main() {
 	unloadFlag := flag.Bool("unload", false, "detach all running filters, remove all pins and exit")
-	configFlag := flag.String("config", "sunet-xdpd.json", "config file")
+	configDirFlag := flag.String("config-dir", "/etc/sunet-xdpd/conf.d", "directory of *.json config files, merged in name order")
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil)).With(
@@ -215,7 +307,7 @@ func main() {
 		return
 	}
 
-	xd := newXdpd(*configFlag, defaultPinDir, logger)
+	xd := newXdpd(*configDirFlag, defaultPinDir, logger)
 	err := xd.run()
 	if err != nil {
 		logger.Error("run failed", "error", err.Error())
@@ -293,7 +385,7 @@ func (xd *xdpd) run() error {
 		return fmt.Errorf("creating %s (is bpffs mounted at /sys/fs/bpf?): %w", xd.pinDir, err)
 	}
 
-	conf, err := readConf(xd.confPath)
+	conf, err := readConf(xd.confDir)
 	if err != nil {
 		return fmt.Errorf("reading config: %w", err)
 	}
@@ -301,7 +393,9 @@ func (xd *xdpd) run() error {
 		if !errors.Is(err, errCleanup) {
 			return fmt.Errorf("loading filters: %w", err)
 		}
-		xd.logger.Warn("filters loaded", "error", err.Error())
+		xd.logger.Warn("filters loaded", "files", conf.fileCounts(), "error", err.Error())
+	} else {
+		xd.logger.Info("filters loaded", "files", conf.fileCounts())
 	}
 
 	ticker := time.NewTicker(5 * time.Second)
@@ -332,10 +426,10 @@ func (xd *xdpd) run() error {
 	}
 }
 
-// reload applies the config file to the running filters. Nothing is
+// reload applies the config directory to the running filters. Nothing is
 // changed if the config can't be read or if any filter fails to build, see apply.
 func (xd *xdpd) reload() {
-	conf, err := readConf(xd.confPath)
+	conf, err := readConf(xd.confDir)
 	if err != nil {
 		xd.logger.Error("reload failed, keeping the running filters", "error", err.Error())
 		return
@@ -344,9 +438,9 @@ func (xd *xdpd) reload() {
 	err = xd.apply(conf)
 	switch {
 	case err == nil:
-		xd.logger.Info("reload done")
+		xd.logger.Info("reload done", "files", conf.fileCounts())
 	case errors.Is(err, errCleanup):
-		xd.logger.Warn("reload done", "error", err.Error())
+		xd.logger.Warn("reload done", "files", conf.fileCounts(), "error", err.Error())
 	default:
 		xd.logger.Error("reload failed", "error", err.Error())
 	}
@@ -1240,7 +1334,7 @@ func buildProgram(bpfDropFilters []bpfDropFilter, linkType layers.LinkType, drop
 	for i, bdf := range bpfDropFilters {
 		filter, err := exprToCBPF(bdf.Expr, linkType)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %w", bdf.Description, err)
+			return nil, fmt.Errorf("%s: %q: %w", bdf.source, bdf.Description, err)
 		}
 
 		result := fmt.Sprintf("result_%d", i)
@@ -1259,7 +1353,7 @@ func buildProgram(bpfDropFilters []bpfDropFilter, linkType layers.LinkType, drop
 			LabelPrefix: fmt.Sprintf("filter%d", i), // unique per filter so labels don't collide
 		})
 		if err != nil {
-			return nil, fmt.Errorf("filter %s: converting to eBPF: %w", bdf.Description, err)
+			return nil, fmt.Errorf("%s: %q: converting to eBPF: %w", bdf.source, bdf.Description, err)
 		}
 
 		prog = append(prog, loadPacket(fmt.Sprintf("filter_%d", i))...)
