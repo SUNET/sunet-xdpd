@@ -17,11 +17,14 @@ impact of adding a given filter.
 
 The eBPF code is instrumented to call hook maps for
 [xdpcap](https://github.com/cloudflare/xdpcap), so that you can capture pcap of
-matched packets for further analysis:
+matched packets for further analysis. There is one hook per interface for
+dropped packets (`<ifname>-drop`) and one for packets matched by a filter in
+monitor mode (`<ifname>-monitor`), e.g. for eth0:
 ```
-xdpcap /sys/fs/bpf/sunet-xdpd/drop - "" | tcpdump -nr -
-xdpcap /sys/fs/bpf/sunet-xdpd/drop - "tcp and port 80" | tcpdump -nr -
-xdpcap /sys/fs/bpf/sunet-xdpd/drop dropped.pcap "tcp and port 80"
+xdpcap /sys/fs/bpf/sunet-xdpd/eth0-drop - "" | tcpdump -nr -
+xdpcap /sys/fs/bpf/sunet-xdpd/eth0-drop - "tcp and port 80" | tcpdump -nr -
+xdpcap /sys/fs/bpf/sunet-xdpd/eth0-drop dropped.pcap "tcp and port 80"
+xdpcap /sys/fs/bpf/sunet-xdpd/eth0-monitor - "" | tcpdump -nr -
 ```
 
 Matched packets are counted per filter and are visible in prometheus metrics
