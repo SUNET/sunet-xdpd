@@ -829,13 +829,9 @@ func buildProgramAndCounters(logger *slog.Logger, iface *net.Interface, linkType
 
 	prog, err := ebpf.NewProgram(progSpec)
 	if err != nil {
-		// The verifier log is the key to debugging hand-built programs,
-		// check for it first since it can wrap EINVAL too.
+		// The verifier log is the key to debugging hand-built programs.
 		if ve, found := errors.AsType[*ebpf.VerifierError](err); found {
-			return nil, nil, fmt.Errorf("loading program: %+v", ve)
-		}
-		if errors.Is(err, unix.EINVAL) {
-			return nil, nil, fmt.Errorf("loading program failed: invalid argument (check if the network driver or kernel version lacks BPF_F_XDP_HAS_FRAGS support): %w", err)
+			return nil, nil, fmt.Errorf("loading program (verifier error): %+v", ve)
 		}
 		return nil, nil, fmt.Errorf("loading program: %w", err)
 	}
@@ -1035,6 +1031,9 @@ func (f *filter) attach(logger *slog.Logger, prog *ebpf.Program) (prev *ebpf.Pro
 		// ===
 		// virtio_net virtio1 ens3: single-buffer XDP requires MTU less than 3506
 		// ===
+		if errors.Is(err, unix.EINVAL) {
+			return nil, fmt.Errorf("attaching XDP for %s (the driver refused it, see dmesg): %w", f.iface.Name, err)
+		}
 		return nil, fmt.Errorf("attaching XDP for %s: %w", f.iface.Name, err)
 	}
 	logger.Info("creating pin", "iface", f.iface.Name, "link_pin", f.linkPin)
