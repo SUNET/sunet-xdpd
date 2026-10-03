@@ -1480,17 +1480,20 @@ func linkTypeName(lt layers.LinkType) string {
 // libpcap needs it to know what's at byte 0 of the packet, and a wrong one
 // silently makes filters compare the wrong bytes.
 func linkTypeFor(ifname string) (linkType layers.LinkType, err error) {
-	rootDir := "/sys/class/net"
-	// sysfs has symlinks in many locations so doing OpenRoot() on rootDir fails
-	// when looking up e.g. "lo" that is itself a symlink pointing outside it.
-	root, err := os.OpenRoot("/sys")
+	rootDir := "/sys"
+	// sysfs has symlinks in many locations so doing OpenRoot() on /sys/class/net fails
+	// when looking up e.g. "lo" that is itself a symlink pointing outside it:
+	// ===
+	// lo -> ../../devices/virtual/net/lo
+	// ===
+	root, err := os.OpenRoot(rootDir)
 	if err != nil {
 		return 0, fmt.Errorf("linkTypeFor(): unable to open root dir %s: %w", rootDir, err)
 	}
 	defer func() {
 		cErr := root.Close()
 		if cErr != nil {
-			err = errors.Join(err, fmt.Errorf("closing /sys root: %w", cErr))
+			err = errors.Join(err, fmt.Errorf("closing %s root: %w", rootDir, cErr))
 		}
 	}()
 
