@@ -1400,7 +1400,7 @@ func buildProgram(bpfDropFilters []bpfDropFilter, linkType layers.LinkType, drop
 	}
 	// If we reached this point the instruction flow neither jumped to
 	// "drop" or "monitor" hooks, meaning no filters was hit and we can
-	// return, R0 is expexted to be set to XDP_PASS in that case.
+	// return, R0 is expected to be set to XDP_PASS in that case.
 	prog = append(prog, asm.Return())
 
 	if hasMonitor {
