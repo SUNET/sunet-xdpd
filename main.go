@@ -2,7 +2,16 @@
 //go:build linux
 
 // sunet-xdpd reads bpf (tcpdump) filter expressions from a directory of config
-// files and creates a XDP program that drops matching packets per interface.
+// files and creates a XDP program per interface that drops or passes matching
+// packets.
+//
+// Each filter has an action, "drop" or "pass", and the filters of an interface
+// are tried in order: the first one that matches a packet decides what happens
+// to it. A packet no filter matches passes. An empty expr matches every packet,
+// so a last filter with an empty expr sets the default action instead; filters
+// after it could never match, which is an error. A filter in monitor mode only
+// counts its matches and does not decide, the filters after it are still
+// tried.
 //
 // The XDP link is pinned so filtering keeps running when sunet-xdpd exits,
 // crashes or restarts. On startup, sunet-xdpd takes over the running filter
@@ -17,9 +26,11 @@
 // place. Each file looks like conf.d.sample/00-base.json and the filters for
 // an interface are appended across files, so separate processes can each own
 // a file, e.g. 00-base.json from config management and 50-<tool>.json per
-// tool. Unknown fields, names in the wrong case or given twice are an error,
-// as is a directory without *.json files: to run without filters use a file
-// containing {}, or -unload.
+// tool. A default filter belongs in a file that sorts last, like
+// 99-default.json. Unknown fields, names in the wrong case or given twice are
+// an error, as is a filter without an "action" or an "expr" and a directory
+// without *.json files: to run without filters use a file containing {}, or
+// -unload.
 //
 // Reload config with:
 //
@@ -28,27 +39,28 @@
 // A reload is all or nothing per run: if any config file can't be read or any
 // BPF expression fails to compile or load, the error is logged and the filters
 // that are running are left as they are. So two filters on one interface with
-// the same description, expr and monitor setting fail it, also in different
-// files. Interfaces removed from the config are detached and their pins
-// removed, also on startup for interfaces that were removed while sunet-xdpd
-// wasn't running. That happens once the new config is running, so if it fails
-// the reload is still done: it is logged as a warning and tried again on the
-// next reload.
+// the same description, expr, action and monitor setting fail it, also in
+// different files. Interfaces removed from the config are detached and their
+// pins removed, also on startup for interfaces that were removed while
+// sunet-xdpd wasn't running. That happens once the new config is running, so
+// if it fails the reload is still done: it is logged as a warning and tried
+// again on the next reload.
 //
 // Pins in /sys/fs/bpf/sunet-xdpd:
 //
 //	<ifname>-link      the XDP attachment, filtering lasts as long as this pin exists
 //	<ifname>-counters  per-filter match counters of the running program, can be inspected with e.g. bpftools
-//	<ifname>-drop      xdpcap hook for dropped packets
-//	<ifname>-monitor   xdpcap hook for passed packets that matched a filter in monitor mode
+//	<ifname>-filter    xdpcap hook for packets a filter dropped or passed
+//	<ifname>-monitor   xdpcap hook for passed packets that matched only filters in monitor mode
 //
-// Capture matched packets via the xdpcap hook files (be careful with using an
-// empty filter if dropping a lot of packets with the filter as it can be a lot
-// of packets):
+// Capture matched packets via the xdpcap hook files, -actions picks dropped or
+// passed packets, by default both (be careful with using an empty filter if a
+// filter matches a lot of packets, as it can be a lot of packets):
 //
-//	xdpcap /sys/fs/bpf/sunet-xdpd/eth0-drop - "" | tcpdump -nr -
-//	xdpcap /sys/fs/bpf/sunet-xdpd/eth0-drop - "tcp and port 80" | tcpdump -nr -
-//	xdpcap /sys/fs/bpf/sunet-xdpd/eth0-drop dropped.pcap "tcp and port 80"
+//	xdpcap -actions drop /sys/fs/bpf/sunet-xdpd/eth0-filter - "" | tcpdump -nr -
+//	xdpcap -actions drop /sys/fs/bpf/sunet-xdpd/eth0-filter - "tcp and port 80" | tcpdump -nr -
+//	xdpcap -actions drop /sys/fs/bpf/sunet-xdpd/eth0-filter dropped.pcap "tcp and port 80"
+//	xdpcap -actions pass /sys/fs/bpf/sunet-xdpd/eth0-filter - "" | tcpdump -nr -
 //	xdpcap /sys/fs/bpf/sunet-xdpd/eth0-monitor - "" | tcpdump -nr -
 
 package main
@@ -71,6 +83,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -108,7 +121,7 @@ var version = "dev" // overridden via -ldflags "-X main.version=..."
 
 // pinKinds are the suffixes of the files we pin per interface, see the
 // package documentation.
-var pinKinds = []string{"link", "counters", "drop", "monitor"}
+var pinKinds = []string{"link", "counters", "filter", "monitor"}
 
 func pinPath(dir, ifname, kind string) string {
 	return filepath.Join(dir, fmt.Sprintf("%s-%s", ifname, kind))
@@ -131,7 +144,13 @@ type metricLabels struct {
 	ifaceName   string
 	description string
 	expr        string
-	mode        string
+	action      string
+	monitor     string
+}
+
+// values returns the label values in the order of promCounterLabels.
+func (ml metricLabels) values() []string {
+	return []string{ml.ifaceName, ml.description, ml.expr, ml.action, ml.monitor}
 }
 
 type config struct {
@@ -141,13 +160,22 @@ type config struct {
 }
 
 type interfaceConfig struct {
-	BPFDropFilters []bpfDropFilter `json:"bpf_drop_filters"`
+	BPFFilters []bpfFilter `json:"bpf_filters"`
 }
 
-type bpfDropFilter struct {
-	Description string `json:"description"`
-	Expr        string `json:"expr"`
-	Monitor     bool   `json:"monitor,omitempty"`
+// filterAction is what happens to a packet matched by a filter.
+type filterAction string
+
+const (
+	actionDrop filterAction = "drop"
+	actionPass filterAction = "pass"
+)
+
+type bpfFilter struct {
+	Description string       `json:"description"`
+	Expr        *string      `json:"expr"` // nil if missing, to tell it from an empty expr
+	Action      filterAction `json:"action"`
+	Monitor     bool         `json:"monitor,omitempty"`
 	// source is the config file the filter was read from, for messages.
 	// Being unexported, encoding/json/v2 never reads or writes it.
 	source string
@@ -166,28 +194,48 @@ func newXdpd(confDir, pinDir string, logger *slog.Logger) *xdpd {
 	}
 }
 
-// validate checks what readConf can't. Filters on one interface with the same
-// description, expr and mode share their metric labels, which would mix up
-// their counts. That holds across config files too, so writers must not reuse
-// each other's filters. An empty expr matches every packet, so a filter
-// without one, more likely a broken writer than intended, is refused rather
-// than dropping all traffic on the interface.
+// validate checks what readConf can't. A filter must have an action, drop or
+// pass, and an expr. Neither has a default: leaving one out is more likely a
+// broken writer than intended, and guessing wrong would drop or pass all
+// traffic on the interface (an empty expr matches every packet, so it can't
+// stand in for a missing one). Filters on one interface with the same
+// description, expr, action and monitor setting share their metric labels,
+// which would mix up their counts. That holds across config files too, so
+// writers must not reuse each other's filters. The first filter that matches a
+// packet decides what happens to it, so filters after one that matches
+// everything (an empty expr) can never match. That is refused rather than
+// leaving them silently dead, which is easy to do across files: a default
+// filter belongs in a file that sorts last, like 99-default.json.
 func (c config) validate() error {
 	type key struct {
 		description, expr string
+		action            filterAction
 		monitor           bool
 	}
 	for _, ifname := range slices.Sorted(maps.Keys(c.Interfaces)) {
-		seen := map[key]bpfDropFilter{}
-		for _, bdf := range c.Interfaces[ifname].BPFDropFilters {
-			if strings.TrimSpace(bdf.Expr) == "" {
-				return fmt.Errorf("%s: filter %q in %s has an empty expr", ifname, bdf.Description, bdf.source)
+		seen := map[key]bpfFilter{}
+		var catchAll *bpfFilter
+		for _, bf := range c.Interfaces[ifname].BPFFilters {
+			switch {
+			case bf.Expr == nil:
+				return fmt.Errorf("%s: filter %q in %s has no expr", ifname, bf.Description, bf.source)
+			case bf.Action == "":
+				return fmt.Errorf("%s: filter %q in %s has no action", ifname, bf.Description, bf.source)
+			case bf.Action != actionDrop && bf.Action != actionPass:
+				return fmt.Errorf("%s: filter %q in %s: action must be %q or %q, not %q", ifname, bf.Description, bf.source, actionDrop, actionPass, bf.Action)
 			}
-			k := key{bdf.Description, bdf.Expr, bdf.Monitor}
+			if catchAll != nil {
+				return fmt.Errorf("%s: filter %q in %s can never match: it comes after filter %q in %s, which has an empty expr and so matches everything", ifname, bf.Description, bf.source, catchAll.Description, catchAll.source)
+			}
+			k := key{bf.Description, *bf.Expr, bf.Action, bf.Monitor}
 			if first, ok := seen[k]; ok {
-				return fmt.Errorf("%s: filter %q in %s duplicates the one in %s", ifname, bdf.Description, bdf.source, first.source)
+				return fmt.Errorf("%s: filter %q in %s duplicates the one in %s", ifname, bf.Description, bf.source, first.source)
 			}
-			seen[k] = bdf
+			seen[k] = bf
+			// A monitor filter never decides, the ones after it are still looked at.
+			if strings.TrimSpace(*bf.Expr) == "" && !bf.Monitor {
+				catchAll = &bf
+			}
 		}
 	}
 	return nil
@@ -200,8 +248,8 @@ func (c config) fileCounts() map[string]int {
 		counts[name] = 0
 	}
 	for _, ifConf := range c.Interfaces {
-		for _, bdf := range ifConf.BPFDropFilters {
-			counts[bdf.source]++
+		for _, bf := range ifConf.BPFFilters {
+			counts[bf.source]++
 		}
 	}
 	return counts
@@ -252,9 +300,9 @@ func readConf(dir string) (conf config, err error) {
 		conf.files = append(conf.files, name)
 		for ifname, ifConf := range fileConf.Interfaces {
 			merged := conf.Interfaces[ifname]
-			for _, bdf := range ifConf.BPFDropFilters {
-				bdf.source = name
-				merged.BPFDropFilters = append(merged.BPFDropFilters, bdf)
+			for _, bf := range ifConf.BPFFilters {
+				bf.source = name
+				merged.BPFFilters = append(merged.BPFFilters, bf)
 			}
 			conf.Interfaces[ifname] = merged
 		}
@@ -269,7 +317,7 @@ func readConf(dir string) (conf config, err error) {
 }
 
 // readConfFile parses one config file. Unknown fields are an error, so a typo
-// like "monitr" can't silently turn a monitor filter into a drop filter. The
+// like "monitr" can't silently turn a monitor filter into one that decides. The
 // json/v2 defaults also refuse names in the wrong case, a name given twice
 // (like an interface, which would otherwise lose the first one's filters) and
 // anything after the JSON object.
@@ -319,7 +367,7 @@ type promMetrics struct {
 	filterHits *prometheus.CounterVec
 }
 
-var promCounterLabels = []string{"iface", "description", "expr", "mode"}
+var promCounterLabels = []string{"iface", "description", "expr", "action", "monitor"}
 
 func newPromMetrics(reg prometheus.Registerer) *promMetrics {
 	m := &promMetrics{
@@ -471,29 +519,29 @@ func pathMissing(path string) bool {
 // The hook maps are shared by every program version, so a running
 // xdpcap session keeps working across reloads.
 type filter struct {
-	pinDir                string
-	linkPin               string
-	iface                 *net.Interface
-	linkType              layers.LinkType
-	dropHook, monitorHook *ebpf.Map
-	link                  link.Link
-	prog                  *ebpf.Program
-	counters              *ebpf.Map
-	bpfDropFilters        []bpfDropFilter
+	pinDir                  string
+	linkPin                 string
+	iface                   *net.Interface
+	linkType                layers.LinkType
+	filterHook, monitorHook *ebpf.Map
+	link                    link.Link
+	prog                    *ebpf.Program
+	counters                *ebpf.Map
+	bpfFilters              []bpfFilter
 }
 
 // pendingFilter is a new program for an interface that is built but not live.
 type pendingFilter struct {
-	f              *filter // the running filter to update, or a new one that isn't attached yet
-	isNew          bool
-	iface          *net.Interface
-	linkType       layers.LinkType
-	bpfDropFilters []bpfDropFilter
-	prog           *ebpf.Program
-	counters       *ebpf.Map
-	swap           swapKind
-	newPins        []string      // hook pins created by prepare, as opposed to found from a previous run
-	prev           *ebpf.Program // for tookOverPinned: the program that was running, to put back
+	f          *filter // the running filter to update, or a new one that isn't attached yet
+	isNew      bool
+	iface      *net.Interface
+	linkType   layers.LinkType
+	bpfFilters []bpfFilter
+	prog       *ebpf.Program
+	counters   *ebpf.Map
+	swap       swapKind
+	newPins    []string      // hook pins created by prepare, as opposed to found from a previous run
+	prev       *ebpf.Program // for tookOverPinned: the program that was running, to put back
 }
 
 // swapKind says how a pendingFilter was made live, which decides how to undo it.
@@ -524,7 +572,7 @@ func (p *pendingFilter) discard(logger *slog.Logger) {
 		logClose(logger, "pending counters", p.counters)
 	}
 	if p.isNew {
-		logClose(logger, "pending drop hook", p.f.dropHook)
+		logClose(logger, "pending filter hook", p.f.filterHook)
 		logClose(logger, "pending monitor hook", p.f.monitorHook)
 
 		// Nothing will ever find these again, but pins from a previous run
@@ -600,7 +648,7 @@ func (xd *xdpd) apply(conf config) error {
 
 		// Nothing is counted after the detach, so this is the final count. Read
 		// it before release closes the counters.
-		xd.collect(ifname, f.counters, f.bpfDropFilters, nil)
+		xd.collect(ifname, f.counters, f.bpfFilters, nil)
 
 		// It is detached now, so forget it even if cleaning up fails below. The
 		// link pin is gone, so keeping it would look like an -unload behind our
@@ -722,10 +770,10 @@ func (xd *xdpd) prepare(conf config) (pending []*pendingFilter, err error) {
 		}
 
 		p := &pendingFilter{
-			f:              xd.filters[ifname],
-			iface:          iface,
-			linkType:       linkType,
-			bpfDropFilters: ifConf.BPFDropFilters,
+			f:          xd.filters[ifname],
+			iface:      iface,
+			linkType:   linkType,
+			bpfFilters: ifConf.BPFFilters,
 		}
 
 		if p.f == nil {
@@ -737,7 +785,7 @@ func (xd *xdpd) prepare(conf config) (pending []*pendingFilter, err error) {
 		}
 		pending = append(pending, p)
 
-		p.prog, p.counters, err = buildProgramAndCounters(xd.logger, iface, linkType, p.bpfDropFilters, p.f.dropHook, p.f.monitorHook)
+		p.prog, p.counters, err = buildProgramAndCounters(xd.logger, iface, linkType, p.bpfFilters, p.f.filterHook, p.f.monitorHook)
 		if err != nil {
 			return pending, fmt.Errorf("%s: %w", ifname, err)
 		}
@@ -752,22 +800,22 @@ func (xd *xdpd) prepare(conf config) (pending []*pendingFilter, err error) {
 func (xd *xdpd) newFilter(iface *net.Interface, linkType layers.LinkType) (*filter, []string, error) {
 	var created []string
 
-	dropPin := pinPath(xd.pinDir, iface.Name, "drop")
-	dropHook, dropCreated, err := openHook(xd.logger, dropPin)
+	filterPin := pinPath(xd.pinDir, iface.Name, "filter")
+	filterHook, filterCreated, err := openHook(xd.logger, filterPin)
 	if err != nil {
 		return nil, nil, err
 	}
-	if dropCreated {
-		created = append(created, dropPin)
+	if filterCreated {
+		created = append(created, filterPin)
 	}
 
 	monitorPin := pinPath(xd.pinDir, iface.Name, "monitor")
 	monitorHook, monitorCreated, err := openHook(xd.logger, monitorPin)
 	if err != nil {
-		logClose(xd.logger, "drop hook", dropHook)
-		if dropCreated {
-			if rErr := os.Remove(dropPin); rErr != nil {
-				xd.logger.Error("removing drop hook pin failed", "pin", dropPin, "error", rErr.Error())
+		logClose(xd.logger, "filter hook", filterHook)
+		if filterCreated {
+			if rErr := os.Remove(filterPin); rErr != nil {
+				xd.logger.Error("removing filter hook pin failed", "pin", filterPin, "error", rErr.Error())
 			}
 		}
 		return nil, nil, err
@@ -781,20 +829,20 @@ func (xd *xdpd) newFilter(iface *net.Interface, linkType layers.LinkType) (*filt
 		linkPin:     pinPath(xd.pinDir, iface.Name, "link"),
 		iface:       iface,
 		linkType:    linkType,
-		dropHook:    dropHook,
+		filterHook:  filterHook,
 		monitorHook: monitorHook,
 	}, created, nil
 }
 
 // buildProgramAndCounters creates the counter map and loads the XDP program
-// for bpfDropFilters, without attaching it to anything.
-func buildProgramAndCounters(logger *slog.Logger, iface *net.Interface, linkType layers.LinkType, bpfDropFilters []bpfDropFilter, dropHook, monitorHook *ebpf.Map) (*ebpf.Program, *ebpf.Map, error) {
+// for bpfFilters, without attaching it to anything.
+func buildProgramAndCounters(logger *slog.Logger, iface *net.Interface, linkType layers.LinkType, bpfFilters []bpfFilter, filterHook, monitorHook *ebpf.Map) (*ebpf.Program, *ebpf.Map, error) {
 	logger.Info("building program", "iface", iface.Name)
 
 	// Fix G115 (CWE-190): integer overflow conversion int -> uint32 (Confidence: MEDIUM, Severity: HIGH)
-	intMaxEntries := len(bpfDropFilters)
+	intMaxEntries := len(bpfFilters)
 	if intMaxEntries < 0 || intMaxEntries > math.MaxUint32 {
-		return nil, nil, fmt.Errorf("the number of bpfDropFilters does not fit in MaxEntries uint32")
+		return nil, nil, fmt.Errorf("the number of bpfFilters does not fit in MaxEntries uint32")
 	}
 	maxEntries := uint32(intMaxEntries)
 	counterName := fmt.Sprintf("%s_filter_counters", iface.Name)
@@ -815,7 +863,7 @@ func buildProgramAndCounters(logger *slog.Logger, iface *net.Interface, linkType
 		}
 	}()
 
-	insns, err := buildProgram(bpfDropFilters, linkType, dropHook, monitorHook, counters)
+	insns, err := buildProgram(bpfFilters, linkType, filterHook, monitorHook, counters)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -937,7 +985,7 @@ func (xd *xdpd) undo(p *pendingFilter) error {
 // have counted first. A later reload attaches it from scratch. The xdpcap hook
 // pins stay: that reload reuses them, so a running xdpcap keeps working.
 func (xd *xdpd) forget(f *filter) error {
-	xd.collect(f.iface.Name, f.counters, f.bpfDropFilters, nil)
+	xd.collect(f.iface.Name, f.counters, f.bpfFilters, nil)
 	delete(xd.filters, f.iface.Name)
 	if err := f.release(xd.logger, []string{"link", "counters"}); err != nil {
 		return fmt.Errorf("removing pins: %w", err)
@@ -950,8 +998,8 @@ func (xd *xdpd) forget(f *filter) error {
 func (xd *xdpd) retire(p *pendingFilter) {
 	f := p.f
 
-	oldProg, oldCounters, oldBPFDropFilters := f.prog, f.counters, f.bpfDropFilters
-	f.prog, f.counters, f.bpfDropFilters = p.prog, p.counters, p.bpfDropFilters
+	oldProg, oldCounters, oldBPFFilters := f.prog, f.counters, f.bpfFilters
+	f.prog, f.counters, f.bpfFilters = p.prog, p.counters, p.bpfFilters
 	if p.isNew {
 		xd.filters[f.iface.Name] = f
 	}
@@ -960,7 +1008,7 @@ func (xd *xdpd) retire(p *pendingFilter) {
 	// has counted since the last updateMetrics has to be collected now, after
 	// the swap and before the map is closed below.
 	if oldCounters != nil {
-		xd.collect(f.iface.Name, oldCounters, oldBPFDropFilters, nil)
+		xd.collect(f.iface.Name, oldCounters, oldBPFFilters, nil)
 	}
 
 	// The new counters start from zero, so the baseline we compute deltas
@@ -999,7 +1047,7 @@ func (xd *xdpd) retire(p *pendingFilter) {
 	}
 	p.closePrev(xd.logger)
 
-	xd.logger.Info("filter attachment", "how", how, "on", f.iface.Name, "link_type", linkTypeName(f.linkType), "num_filters", len(p.bpfDropFilters), "pins_dir", f.pinDir)
+	xd.logger.Info("filter attachment", "how", how, "on", f.iface.Name, "link_type", linkTypeName(f.linkType), "num_filters", len(p.bpfFilters), "pins_dir", f.pinDir)
 }
 
 // attach takes over the pinned link if a previous run left one, swapping
@@ -1112,8 +1160,8 @@ func (f *filter) Close() error {
 	if f.counters != nil {
 		errs = append(errs, closeErr("counters", f.counters))
 	}
-	if f.dropHook != nil {
-		errs = append(errs, closeErr("drop hook", f.dropHook))
+	if f.filterHook != nil {
+		errs = append(errs, closeErr("filter hook", f.filterHook))
 	}
 	if f.monitorHook != nil {
 		errs = append(errs, closeErr("monitor hook", f.monitorHook))
@@ -1257,15 +1305,15 @@ func logClose(logger *slog.Logger, what string, c io.Closer) {
 func (xd *xdpd) updateMetrics() {
 	seenMetrics := map[metricLabels]struct{}{}
 	for _, f := range xd.filters {
-		xd.collect(f.iface.Name, f.counters, f.bpfDropFilters, seenMetrics)
+		xd.collect(f.iface.Name, f.counters, f.bpfFilters, seenMetrics)
 	}
 
 	// Remove metrics that refer to label sets that no longer match a filter
 	for ml := range xd.currentMetrics {
 		if _, found := seenMetrics[ml]; !found {
-			deleted := xd.pm.filterHits.DeleteLabelValues(ml.ifaceName, ml.description, ml.expr, ml.mode)
+			deleted := xd.pm.filterHits.DeleteLabelValues(ml.values()...)
 			if deleted {
-				xd.logger.Info("deleted metrics for removed filter", "iface", ml.ifaceName, "description", ml.description, "expr", ml.expr, "mode", ml.mode)
+				xd.logger.Info("deleted metrics for removed filter", "iface", ml.ifaceName, "description", ml.description, "expr", ml.expr, "action", ml.action, "monitor", ml.monitor)
 			} else {
 				xd.logger.Error("unable to delete metrics for unmanaged interface", "iface", ml.ifaceName)
 			}
@@ -1275,20 +1323,16 @@ func (xd *xdpd) updateMetrics() {
 }
 
 // collect adds what counters (a per-CPU array with one counter per entry in
-// bpfDropFilters) has counted since the last time to the prometheus metrics. The
+// bpfFilters) has counted since the last time to the prometheus metrics. The
 // metrics it touched are added to seen, if that is not nil.
-func (xd *xdpd) collect(ifname string, counters *ebpf.Map, bpfDropFilters []bpfDropFilter, seen map[metricLabels]struct{}) {
-	for i, bfd := range bpfDropFilters {
-		mode := "drop"
-		if bfd.Monitor {
-			mode = "monitor"
-		}
-
+func (xd *xdpd) collect(ifname string, counters *ebpf.Map, bpfFilters []bpfFilter, seen map[metricLabels]struct{}) {
+	for i, bf := range bpfFilters {
 		ml := metricLabels{
 			ifaceName:   ifname,
-			description: bfd.Description,
-			expr:        bfd.Expr,
-			mode:        mode,
+			description: bf.Description,
+			expr:        *bf.Expr,
+			action:      string(bf.Action),
+			monitor:     strconv.FormatBool(bf.Monitor),
 		}
 
 		if seen != nil {
@@ -1297,7 +1341,7 @@ func (xd *xdpd) collect(ifname string, counters *ebpf.Map, bpfDropFilters []bpfD
 
 		var perCPU []uint64
 		if err := counters.Lookup(uint32(i), &perCPU); err != nil {
-			xd.logger.Error("reading counters failed", "description", bfd.Description, "error", err.Error())
+			xd.logger.Error("reading counters failed", "description", bf.Description, "error", err.Error())
 			continue
 		}
 
@@ -1313,26 +1357,46 @@ func (xd *xdpd) collect(ifname string, counters *ebpf.Map, bpfDropFilters []bpfD
 		}
 		xd.currentMetrics[ml] = total
 
-		xd.pm.filterHits.WithLabelValues(ml.ifaceName, ml.description, ml.expr, ml.mode).Add(float64(delta))
+		xd.pm.filterHits.WithLabelValues(ml.values()...).Add(float64(delta))
 	}
 }
 
-// buildProgram assembles the XDP program
-func buildProgram(bpfDropFilters []bpfDropFilter, linkType layers.LinkType, dropHook, monitorHook, counters *ebpf.Map) (asm.Instructions, error) {
+// actionVerdicts are the XDP verdicts of the filter actions. The program has
+// an exit per action, labelled with the action, that returns its verdict
+// through the filter hook, so xdpcap -actions can pick drops or passes.
+var actionVerdicts = map[filterAction]int32{actionDrop: xdpDrop, actionPass: xdpPass}
+
+// buildProgram assembles the XDP program. The filters are tried in order and
+// the first one that matches decides, except that a monitor filter only counts
+// the match and goes on with the next one. A packet no filter decides for
+// passes.
+func buildProgram(bpfFilters []bpfFilter, linkType layers.LinkType, filterHook, monitorHook, counters *ebpf.Map) (asm.Instructions, error) {
 	prog := asm.Instructions{
 		asm.Mov.Reg(asm.R9, asm.R1), // save ctx; R9 is callee-saved and not given to cbpfc
 		asm.Mov.Imm(asm.R8, 0),      // "a monitor filter matched" flag, also callee-saved
 	}
 
-	for i, bdf := range bpfDropFilters {
-		filter, err := exprToCBPF(bdf.Expr, linkType)
+	// The verifier rejects unreachable code, so only the exits that some
+	// filter can actually reach are emitted below.
+	usedActions := map[filterAction]bool{}
+	hasMonitor := false
+
+	for i, bf := range bpfFilters {
+		if _, ok := actionVerdicts[bf.Action]; !ok {
+			return nil, fmt.Errorf("%s: %q: unknown action %q", bf.source, bf.Description, bf.Action)
+		}
+		if bf.Expr == nil {
+			return nil, fmt.Errorf("%s: %q: no expr", bf.source, bf.Description)
+		}
+
+		filter, err := exprToCBPF(*bf.Expr, linkType)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %q: %w", bdf.source, bdf.Description, err)
+			return nil, fmt.Errorf("%s: %q: %w", bf.source, bf.Description, err)
 		}
 
 		result := fmt.Sprintf("result_%d", i)
-		next := "pass"
-		if i+1 < len(bpfDropFilters) {
+		next := "no_match"
+		if i+1 < len(bpfFilters) {
 			next = fmt.Sprintf("filter_%d", i+1)
 		}
 
@@ -1346,7 +1410,7 @@ func buildProgram(bpfDropFilters []bpfDropFilter, linkType layers.LinkType, drop
 			LabelPrefix: fmt.Sprintf("filter%d", i), // unique per filter so labels don't collide
 		})
 		if err != nil {
-			return nil, fmt.Errorf("%s: %q: converting to eBPF: %w", bdf.source, bdf.Description, err)
+			return nil, fmt.Errorf("%s: %q: converting to eBPF: %w", bf.source, bf.Description, err)
 		}
 
 		prog = append(prog, loadPacket(fmt.Sprintf("filter_%d", i))...)
@@ -1361,53 +1425,46 @@ func buildProgram(bpfDropFilters []bpfDropFilter, linkType layers.LinkType, drop
 		// If there was a match we end up here, and increment the filter hit counter:
 		prog = append(prog, countFilter(counters, i)...)
 
-		if bdf.Monitor {
+		if bf.Monitor {
 			// If the filter was matched but is currently in
 			// "monitor" mode just remember that we hit it and
-			// continue with the next filter or pass the packet
+			// continue with the next filter, or "no_match" if on the
+			// last filter
 			prog = append(
 				prog,
 				asm.Mov.Imm(asm.R8, 1), // remember the match, keep evaluating
-				// Jump to either the next filter or "pass" if on the last filter:
 				asm.Ja.Label(next),
 			)
-		} else {
-			// This is a real filter filter, drop the packet
-			prog = append(prog, asm.Ja.Label("drop"))
-		}
-	}
-
-	// The verifier rejects unreachable code, so only emit the exits
-	// that some filter can actually reach.
-	hasDrop, hasMonitor := false, false
-	for _, bdf := range bpfDropFilters {
-		if bdf.Monitor {
 			hasMonitor = true
 		} else {
-			hasDrop = true
+			// The first filter that matches decides: jump to the exit of its action
+			prog = append(prog, asm.Ja.Label(string(bf.Action)))
+			usedActions[bf.Action] = true
 		}
 	}
 
 	if hasMonitor {
 		// If the code above encountered a matching monitoring filter,
-		// filled in R8 and ended up jumping to "pass" because the
-		// packet did not encounter any actual drop filters, jump to
-		// the the monitor hook tagged via .WithSymbol("monitor"):
-		prog = append(prog, asm.JNE.Imm(asm.R8, 0, "monitor").WithSymbol("pass"))
+		// filled in R8 and ended up jumping to "no_match" because no
+		// other filter decided for the packet, jump to the monitor
+		// hook tagged via .WithSymbol("monitor"):
+		prog = append(prog, asm.JNE.Imm(asm.R8, 0, "monitor").WithSymbol("no_match"))
 		prog = append(prog, asm.Mov.Imm(asm.R0, xdpPass))
 	} else {
-		prog = append(prog, asm.Mov.Imm(asm.R0, xdpPass).WithSymbol("pass"))
+		prog = append(prog, asm.Mov.Imm(asm.R0, xdpPass).WithSymbol("no_match"))
 	}
-	// If we reached this point the instruction flow neither jumped to
-	// "drop" or "monitor" hooks, meaning no filters was hit and we can
-	// return, R0 is expected to be set to XDP_PASS in that case.
+	// If we reached this point no filter matched, not even one in monitor
+	// mode, and we can return, R0 is expected to be set to XDP_PASS in that
+	// case.
 	prog = append(prog, asm.Return())
 
 	if hasMonitor {
 		prog = append(prog, hookExit("monitor", monitorHook, xdpPass)...)
 	}
-	if hasDrop {
-		prog = append(prog, hookExit("drop", dropHook, xdpDrop)...)
+	for _, action := range []filterAction{actionDrop, actionPass} {
+		if usedActions[action] {
+			prog = append(prog, hookExit(string(action), filterHook, actionVerdicts[action])...)
+		}
 	}
 
 	return prog, nil
