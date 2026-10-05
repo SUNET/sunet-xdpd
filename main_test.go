@@ -32,6 +32,9 @@ import (
 
 const xdpTX = 3 // stand-in "xdpcap was here" verdict, see attachFakeCapture
 
+// udpPacket is an Ethernet frame of 42+payloadLen bytes: 14 Ethernet, 20 IPv4
+// and 8 UDP header bytes before the payload. gopacket pads frames to the 60
+// byte Ethernet minimum, so a payloadLen of 10 makes 60 bytes, not 52.
 func udpPacket(t *testing.T, srcPort, dstPort uint16, payloadLen int) []byte {
 	t.Helper()
 
@@ -96,7 +99,7 @@ func loadTestProgFor(t *testing.T, filters []bpfFilter, linkType layers.LinkType
 	})
 
 	counters, err := ebpf.NewMap(&ebpf.MapSpec{
-		Type: ebpf.PerCPUArray, KeySize: 4, ValueSize: 8,
+		Type: ebpf.PerCPUArray, KeySize: 4, ValueSize: filterCountSize,
 		MaxEntries: uint32(max(len(filters), 1)),
 	})
 	if err != nil {
@@ -139,15 +142,17 @@ func (p *testProg) run(t *testing.T, pkt []byte) uint32 {
 	return ret
 }
 
-func (p *testProg) count(t *testing.T, index int) uint64 {
+// count returns what the filter at index has counted, summed over the CPUs.
+func (p *testProg) count(t *testing.T, index int) filterCount {
 	t.Helper()
-	var perCPU []uint64
+	var perCPU []filterCount
 	if err := p.counters.Lookup(uint32(index), &perCPU); err != nil {
 		t.Fatal(err)
 	}
-	var total uint64
+	var total filterCount
 	for _, v := range perCPU {
-		total += v
+		total.Packets += v.Packets
+		total.Bytes += v.Bytes
 	}
 	return total
 }
@@ -198,6 +203,9 @@ func TestVerdictsAndCounters(t *testing.T) {
 	if got := p.run(t, udpPacket(t, 1234, 9999, 10)); got != xdpDrop {
 		t.Errorf("udp to 9999: got %d, want XDP_DROP", got)
 	}
+	if got := p.run(t, udpPacket(t, 1234, 9999, 100)); got != xdpDrop {
+		t.Errorf("larger udp to 9999: got %d, want XDP_DROP", got)
+	}
 	if got := p.run(t, udpPacket(t, 53, 4321, 1200)); got != xdpPass {
 		t.Errorf("large DNS response (monitor filter): got %d, want XDP_PASS", got)
 	}
@@ -208,11 +216,12 @@ func TestVerdictsAndCounters(t *testing.T) {
 		t.Errorf("unrelated packet: got %d, want XDP_PASS", got)
 	}
 
-	if got := p.count(t, 0); got != 1 {
-		t.Errorf("udp-9999 counter: got %d, want 1", got)
+	// The bytes of every packet a filter matched add up, 60 + 142 for udp-9999.
+	if got, want := p.count(t, 0), (filterCount{Packets: 2, Bytes: 202}); got != want {
+		t.Errorf("udp-9999 counter: got %+v, want %+v", got, want)
 	}
-	if got := p.count(t, 1); got != 1 {
-		t.Errorf("dns-amp counter: got %d, want 1", got)
+	if got, want := p.count(t, 1), (filterCount{Packets: 1, Bytes: 1242}); got != want {
+		t.Errorf("dns-amp counter: got %+v, want %+v", got, want)
 	}
 }
 
@@ -268,11 +277,11 @@ func TestFirstMatchWins(t *testing.T) {
 			if got := p.run(t, pkt); got != tc.want {
 				t.Errorf("got %d, want %d", got, tc.want)
 			}
-			if got := p.count(t, 0); got != 1 {
-				t.Errorf("first filter counter: got %d, want 1", got)
+			if got, want := p.count(t, 0), (filterCount{Packets: 1, Bytes: 60}); got != want {
+				t.Errorf("first filter counter: got %+v, want %+v", got, want)
 			}
-			if got := p.count(t, 1); got != 0 {
-				t.Errorf("second filter counter: got %d, want 0", got)
+			if got, want := p.count(t, 1), (filterCount{}); got != want {
+				t.Errorf("second filter counter: got %+v, want %+v", got, want)
 			}
 		})
 	}
@@ -304,11 +313,11 @@ func TestDefaultAction(t *testing.T) {
 					t.Errorf("other packet: got %d, want %d", got, tc.wantOther)
 				}
 			}
-			if got := p.count(t, 0); got != 1 {
-				t.Errorf("first filter counter: got %d, want 1", got)
+			if got, want := p.count(t, 0), (filterCount{Packets: 1, Bytes: 60}); got != want {
+				t.Errorf("first filter counter: got %+v, want %+v", got, want)
 			}
-			if got := p.count(t, 1); got != 2 {
-				t.Errorf("default filter counter: got %d, want 2", got)
+			if got, want := p.count(t, 1), (filterCount{Packets: 2, Bytes: 120}); got != want {
+				t.Errorf("default filter counter: got %+v, want %+v", got, want)
 			}
 		})
 	}
@@ -321,8 +330,8 @@ func TestOnlyDefaultFilter(t *testing.T) {
 		if got := p.run(t, udpPacket(t, 1234, 80, 10)); got != want {
 			t.Errorf("default %s: got %d, want %d", action, got, want)
 		}
-		if got := p.count(t, 0); got != 1 {
-			t.Errorf("default %s counter: got %d, want 1", action, got)
+		if got, want := p.count(t, 0), (filterCount{Packets: 1, Bytes: 60}); got != want {
+			t.Errorf("default %s counter: got %+v, want %+v", action, got, want)
 		}
 	}
 }
@@ -337,11 +346,12 @@ func TestMonitorPassFilter(t *testing.T) {
 	if got := p.run(t, udpPacket(t, 53, 4321, 10)); got != xdpDrop {
 		t.Errorf("got %d, want XDP_DROP from the default filter", got)
 	}
-	if got := p.count(t, 0); got != 1 {
-		t.Errorf("monitor counter: got %d, want 1", got)
+	// Both count the whole packet.
+	if got, want := p.count(t, 0), (filterCount{Packets: 1, Bytes: 60}); got != want {
+		t.Errorf("monitor counter: got %+v, want %+v", got, want)
 	}
-	if got := p.count(t, 1); got != 1 {
-		t.Errorf("default counter: got %d, want 1", got)
+	if got, want := p.count(t, 1), (filterCount{Packets: 1, Bytes: 60}); got != want {
+		t.Errorf("default counter: got %+v, want %+v", got, want)
 	}
 }
 
@@ -386,8 +396,11 @@ func TestMonitorThenDrop(t *testing.T) {
 	if got := p.run(t, udpPacket(t, 53, 9999, 10)); got != xdpDrop {
 		t.Errorf("got %d, want XDP_DROP via the filter hook", got)
 	}
-	if got := p.count(t, 0); got != 1 {
-		t.Errorf("monitor counter: got %d, want 1", got)
+	if got, want := p.count(t, 0), (filterCount{Packets: 1, Bytes: 60}); got != want {
+		t.Errorf("monitor counter: got %+v, want %+v", got, want)
+	}
+	if got, want := p.count(t, 1), (filterCount{Packets: 1, Bytes: 60}); got != want {
+		t.Errorf("drop counter: got %+v, want %+v", got, want)
 	}
 }
 
@@ -545,6 +558,10 @@ func TestRawLinkType(t *testing.T) {
 	}
 	if got := raw.run(t, rawUDPPacket(t, 1234, 80)); got != xdpPass {
 		t.Errorf("raw link type filters, raw packet to 80: got %d, want XDP_PASS", got)
+	}
+	// Without an Ethernet header there are 14 bytes less to count.
+	if got, want := raw.count(t, 0), (filterCount{Packets: 1, Bytes: 46}); got != want {
+		t.Errorf("raw link type counter: got %+v, want %+v", got, want)
 	}
 
 	// Ethernet link type filters on a raw packet read every field 14 bytes off: no error, no match.
@@ -979,8 +996,19 @@ func TestUnloadAllNothingPinned(t *testing.T) {
 	}
 }
 
-// filterHits returns what prometheus would report for bpfFilter on ifname.
-func filterHits(t *testing.T, xd *xdpd, ifname string, bf bpfFilter) float64 {
+// filterPackets returns the packets prometheus would report for bpfFilter on ifname.
+func filterPackets(t *testing.T, xd *xdpd, ifname string, bf bpfFilter) float64 {
+	t.Helper()
+	return filterMetric(t, xd, "filter_packets_total", ifname, bf)
+}
+
+// filterBytes returns the bytes prometheus would report for bpfFilter on ifname.
+func filterBytes(t *testing.T, xd *xdpd, ifname string, bf bpfFilter) float64 {
+	t.Helper()
+	return filterMetric(t, xd, "filter_bytes_total", ifname, bf)
+}
+
+func filterMetric(t *testing.T, xd *xdpd, name, ifname string, bf bpfFilter) float64 {
 	t.Helper()
 
 	families, err := xd.reg.Gather()
@@ -988,7 +1016,7 @@ func filterHits(t *testing.T, xd *xdpd, ifname string, bf bpfFilter) float64 {
 		t.Fatal(err)
 	}
 	for _, family := range families {
-		if family.GetName() != "filter_packets_total" {
+		if family.GetName() != name {
 			continue
 		}
 		for _, m := range family.GetMetric() {
@@ -1004,8 +1032,8 @@ func filterHits(t *testing.T, xd *xdpd, ifname string, bf bpfFilter) float64 {
 	return 0
 }
 
-// sendUDP9999 runs n packets matching "udp dst port 9999" through the program
-// of f, as if they had arrived on the interface.
+// sendUDP9999 runs n packets matching "udp dst port 9999", of 60 bytes each,
+// through the program of f, as if they had arrived on the interface.
 func sendUDP9999(t *testing.T, f *filter, n int) {
 	t.Helper()
 
@@ -1043,13 +1071,30 @@ func TestMetricLabels(t *testing.T) {
 	}
 	xd.updateMetrics()
 
+	// Gather sorts the labels by name.
+	watch := "action=drop,description=watch-9999,expr=udp dst port 9999,iface=" + ifname + ",monitor=true"
+	pass := "action=pass,description=pass-9999,expr=udp dst port 9999,iface=" + ifname + ",monitor=false"
+	def := "action=drop,description=default,expr=,iface=" + ifname + ",monitor=false"
+	if got, want := metricSeries(t, xd, "filter_packets_total"), map[string]float64{watch: 1, pass: 1, def: 0}; !maps.Equal(got, want) {
+		t.Errorf("packets: got %v, want %v", got, want)
+	}
+	if got, want := metricSeries(t, xd, "filter_bytes_total"), map[string]float64{watch: 60, pass: 60, def: 0}; !maps.Equal(got, want) {
+		t.Errorf("bytes: got %v, want %v", got, want)
+	}
+}
+
+// metricSeries returns the values of the series of the metric name, keyed by
+// their labels.
+func metricSeries(t *testing.T, xd *xdpd, name string) map[string]float64 {
+	t.Helper()
+
 	families, err := xd.reg.Gather()
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := map[string]float64{}
 	for _, family := range families {
-		if family.GetName() != "filter_packets_total" {
+		if family.GetName() != name {
 			continue
 		}
 		for _, m := range family.GetMetric() {
@@ -1060,14 +1105,33 @@ func TestMetricLabels(t *testing.T) {
 			got[strings.Join(labels, ",")] = m.GetCounter().GetValue()
 		}
 	}
-	// Gather sorts the labels by name.
-	want := map[string]float64{
-		"action=drop,description=watch-9999,expr=udp dst port 9999,iface=" + ifname + ",monitor=true": 1,
-		"action=pass,description=pass-9999,expr=udp dst port 9999,iface=" + ifname + ",monitor=false": 1,
-		"action=drop,description=default,expr=,iface=" + ifname + ",monitor=false":                    0,
+	return got
+}
+
+// A filter that is removed from the config takes its series with it, the
+// packets as well as the bytes.
+func TestUpdateMetricsRemovesSeriesOfRemovedFilter(t *testing.T) {
+	requireRoot(t)
+	xd, ifname := newTestXdpd(t)
+
+	keep := bpfFilter{Description: "keep", Expr: new("udp dst port 9998"), Action: actionDrop}
+	gone := bpfFilter{Description: "gone", Expr: new("udp dst port 9999"), Action: actionDrop}
+	if err := xd.apply(confFor(ifname, keep, gone)); err != nil {
+		t.Fatal(err)
 	}
-	if !maps.Equal(got, want) {
-		t.Errorf("got %v, want %v", got, want)
+	sendUDP9999(t, xd.filters[ifname], 1)
+	xd.updateMetrics()
+
+	if err := xd.apply(confFor(ifname, keep)); err != nil {
+		t.Fatal(err)
+	}
+	xd.updateMetrics()
+
+	want := map[string]float64{"action=drop,description=keep,expr=udp dst port 9998,iface=" + ifname + ",monitor=false": 0}
+	for _, name := range []string{"filter_packets_total", "filter_bytes_total"} {
+		if got := metricSeries(t, xd, name); !maps.Equal(got, want) {
+			t.Errorf("%s: got %v, want %v", name, got, want)
+		}
 	}
 }
 
@@ -1087,20 +1151,61 @@ func TestApplyKeepsCountsOfReplacedProgram(t *testing.T) {
 	if err := xd.apply(confFor(ifname, drop, bpfFilter{Description: "two", Expr: new("udp dst port 9998"), Action: actionDrop})); err != nil {
 		t.Fatal(err)
 	}
-	if got := filterHits(t, xd, ifname, drop); got != 3 {
-		t.Errorf("after reload: got %v hits, want 3", got)
+	if got := filterPackets(t, xd, ifname, drop); got != 3 {
+		t.Errorf("after reload: got %v packets, want 3", got)
+	}
+	if got := filterBytes(t, xd, ifname, drop); got != 180 {
+		t.Errorf("after reload: got %v bytes, want 180", got)
 	}
 
 	// The new program starts from zero, and must not be counted on top of the old one.
 	xd.updateMetrics()
-	if got := filterHits(t, xd, ifname, drop); got != 3 {
-		t.Errorf("after updateMetrics: got %v hits, want 3", got)
+	if got := filterPackets(t, xd, ifname, drop); got != 3 {
+		t.Errorf("after updateMetrics: got %v packets, want 3", got)
+	}
+	if got := filterBytes(t, xd, ifname, drop); got != 180 {
+		t.Errorf("after updateMetrics: got %v bytes, want 180", got)
 	}
 
 	sendUDP9999(t, xd.filters[ifname], 2)
 	xd.updateMetrics()
-	if got := filterHits(t, xd, ifname, drop); got != 5 {
-		t.Errorf("after more packets: got %v hits, want 5", got)
+	if got := filterPackets(t, xd, ifname, drop); got != 5 {
+		t.Errorf("after more packets: got %v packets, want 5", got)
+	}
+	if got := filterBytes(t, xd, ifname, drop); got != 300 {
+		t.Errorf("after more packets: got %v bytes, want 300", got)
+	}
+}
+
+// After a reload, the deltas of the new program's counters must be taken
+// from zero, not from what the old program had counted. A baseline left at
+// the old total would still give the right result as long as the new program
+// has counted less than that by the next updateMetrics: collect takes a total
+// that went down for a recreated counter map and counts all of it. So the new
+// program has to count more than the old one did (4 > 3) to show the
+// difference.
+func TestApplyResetsBaselineOfReplacedProgram(t *testing.T) {
+	requireRoot(t)
+	xd, ifname := newTestXdpd(t)
+
+	drop := bpfFilter{Description: "one", Expr: new("udp dst port 9999"), Action: actionDrop}
+	if err := xd.apply(confFor(ifname, drop)); err != nil {
+		t.Fatal(err)
+	}
+	sendUDP9999(t, xd.filters[ifname], 3)
+	xd.updateMetrics()
+
+	if err := xd.apply(confFor(ifname, drop, bpfFilter{Description: "two", Expr: new("udp dst port 9998"), Action: actionDrop})); err != nil {
+		t.Fatal(err)
+	}
+	sendUDP9999(t, xd.filters[ifname], 4)
+	xd.updateMetrics()
+
+	if got := filterPackets(t, xd, ifname, drop); got != 7 {
+		t.Errorf("got %v packets, want 7", got)
+	}
+	if got := filterBytes(t, xd, ifname, drop); got != 420 {
+		t.Errorf("got %v bytes, want 420", got)
 	}
 }
 
@@ -1118,8 +1223,11 @@ func TestApplyKeepsCountsOfRemovedInterface(t *testing.T) {
 	if err := xd.apply(config{}); err != nil {
 		t.Fatal(err)
 	}
-	if got := filterHits(t, xd, ifname, drop); got != 3 {
-		t.Errorf("got %v hits, want 3", got)
+	if got := filterPackets(t, xd, ifname, drop); got != 3 {
+		t.Errorf("got %v packets, want 3", got)
+	}
+	if got := filterBytes(t, xd, ifname, drop); got != 180 {
+		t.Errorf("got %v bytes, want 180", got)
 	}
 }
 
@@ -1453,7 +1561,7 @@ func TestApplyTracksSwapThatCouldNotBePutBack(t *testing.T) {
 	if _, liveID := liveProg(t, f); liveID != progID {
 		t.Errorf("the link runs program %d, the filter tracks %d", liveID, progID)
 	}
-	var perCPU []uint64
+	var perCPU []filterCount
 	if err := f.counters.Lookup(uint32(1), &perCPU); err != nil {
 		t.Errorf("the tracked counters can't be read: %v", err)
 	}
