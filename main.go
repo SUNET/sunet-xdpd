@@ -49,7 +49,7 @@
 // Pins in /sys/fs/bpf/sunet-xdpd:
 //
 //	<ifname>-link      the XDP attachment, filtering lasts as long as this pin exists
-//	<ifname>-counters  per-filter match counters of the running program, can be inspected with e.g. bpftools
+//	<ifname>-counters  per-filter packet and byte counters of the running program, can be inspected with e.g. bpftool
 //	<ifname>-filter    xdpcap hook for packets a filter dropped or passed
 //	<ifname>-monitor   xdpcap hook for passed packets that matched only filters in monitor mode
 //
@@ -137,7 +137,7 @@ type xdpd struct {
 	logger         *slog.Logger
 	reg            *prometheus.Registry
 	pm             *promMetrics
-	currentMetrics map[metricLabels]uint64
+	currentMetrics map[metricLabels]filterCount
 }
 
 type metricLabels struct {
@@ -190,7 +190,7 @@ func newXdpd(confDir, pinDir string, logger *slog.Logger) *xdpd {
 		logger:         logger,
 		reg:            reg,
 		pm:             newPromMetrics(reg),
-		currentMetrics: map[metricLabels]uint64{},
+		currentMetrics: map[metricLabels]filterCount{},
 	}
 }
 
@@ -363,18 +363,37 @@ func main() {
 	}
 }
 
+// filterCount is the value of a filter in the counters map, what it matched
+// on one CPU. The program writes it in native byte order at the offsets of
+// the fields, see countFilter.
+type filterCount struct {
+	Packets uint64
+	Bytes   uint64 // from xdp_md->data to data_end, all of the packet as XDP sees it
+}
+
+// filterCountSize is the size of filterCount, the value size of the counters map.
+const filterCountSize = 16
+
 type promMetrics struct {
-	filterHits *prometheus.CounterVec
+	filterPackets *prometheus.CounterVec
+	filterBytes   *prometheus.CounterVec
 }
 
 var promCounterLabels = []string{"iface", "description", "expr", "action", "monitor"}
 
 func newPromMetrics(reg prometheus.Registerer) *promMetrics {
 	m := &promMetrics{
-		filterHits: promauto.With(reg).NewCounterVec(
+		filterPackets: promauto.With(reg).NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "filter_packets_total",
 				Help: "The total number of packets that matched a filter expression",
+			},
+			promCounterLabels,
+		),
+		filterBytes: promauto.With(reg).NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "filter_bytes_total",
+				Help: "The total number of bytes in packets that matched a filter expression",
 			},
 			promCounterLabels,
 		),
@@ -850,7 +869,7 @@ func buildProgramAndCounters(logger *slog.Logger, iface *net.Interface, linkType
 		Name:       counterName,
 		Type:       ebpf.PerCPUArray,
 		KeySize:    4,
-		ValueSize:  8,
+		ValueSize:  filterCountSize,
 		MaxEntries: uint32(max(maxEntries, 1)), // a zero-size map fails to create
 	})
 	if err != nil {
@@ -1015,7 +1034,7 @@ func (xd *xdpd) retire(p *pendingFilter) {
 	// against has to as well.
 	for ml := range xd.currentMetrics {
 		if ml.ifaceName == f.iface.Name {
-			xd.currentMetrics[ml] = 0
+			xd.currentMetrics[ml] = filterCount{}
 		}
 	}
 
@@ -1311,8 +1330,9 @@ func (xd *xdpd) updateMetrics() {
 	// Remove metrics that refer to label sets that no longer match a filter
 	for ml := range xd.currentMetrics {
 		if _, found := seenMetrics[ml]; !found {
-			deleted := xd.pm.filterHits.DeleteLabelValues(ml.values()...)
-			if deleted {
+			deletedPackets := xd.pm.filterPackets.DeleteLabelValues(ml.values()...)
+			deletedBytes := xd.pm.filterBytes.DeleteLabelValues(ml.values()...)
+			if deletedPackets && deletedBytes {
 				xd.logger.Info("deleted metrics for removed filter", "iface", ml.ifaceName, "description", ml.description, "expr", ml.expr, "action", ml.action, "monitor", ml.monitor)
 			} else {
 				xd.logger.Error("unable to delete metrics for unmanaged interface", "iface", ml.ifaceName)
@@ -1322,9 +1342,9 @@ func (xd *xdpd) updateMetrics() {
 	}
 }
 
-// collect adds what counters (a per-CPU array with one counter per entry in
-// bpfFilters) has counted since the last time to the prometheus metrics. The
-// metrics it touched are added to seen, if that is not nil.
+// collect adds what counters (a per-CPU array with one filterCount per entry
+// in bpfFilters) has counted since the last time to the prometheus metrics.
+// The metrics it touched are added to seen, if that is not nil.
 func (xd *xdpd) collect(ifname string, counters *ebpf.Map, bpfFilters []bpfFilter, seen map[metricLabels]struct{}) {
 	for i, bf := range bpfFilters {
 		ml := metricLabels{
@@ -1339,25 +1359,27 @@ func (xd *xdpd) collect(ifname string, counters *ebpf.Map, bpfFilters []bpfFilte
 			seen[ml] = struct{}{}
 		}
 
-		var perCPU []uint64
+		var perCPU []filterCount
 		if err := counters.Lookup(uint32(i), &perCPU); err != nil {
 			xd.logger.Error("reading counters failed", "description", bf.Description, "error", err.Error())
 			continue
 		}
 
-		var total uint64
+		var total filterCount
 		for _, v := range perCPU {
-			total += v
+			total.Packets += v.Packets
+			total.Bytes += v.Bytes
 		}
 
 		prev := xd.currentMetrics[ml]
-		delta := total - prev
-		if total < prev { // counter map was recreated
+		delta := filterCount{Packets: total.Packets - prev.Packets, Bytes: total.Bytes - prev.Bytes}
+		if total.Packets < prev.Packets || total.Bytes < prev.Bytes { // counter map was recreated
 			delta = total
 		}
 		xd.currentMetrics[ml] = total
 
-		xd.pm.filterHits.WithLabelValues(ml.values()...).Add(float64(delta))
+		xd.pm.filterPackets.WithLabelValues(ml.values()...).Add(float64(delta.Packets))
+		xd.pm.filterBytes.WithLabelValues(ml.values()...).Add(float64(delta.Bytes))
 	}
 }
 
@@ -1480,7 +1502,8 @@ func loadPacket(label string) asm.Instructions {
 	}
 }
 
-// countFilter does counters[i]++ on a per-CPU array.
+// countFilter adds the packet to counters[i] on a per-CPU array: one to its
+// Packets and the packet length to its Bytes, see filterCount.
 func countFilter(counters *ebpf.Map, i int) asm.Instructions {
 	done := fmt.Sprintf("counted_%d", i)
 	return asm.Instructions{
@@ -1489,10 +1512,17 @@ func countFilter(counters *ebpf.Map, i int) asm.Instructions {
 		asm.Mov.Reg(asm.R2, asm.RFP),
 		asm.Add.Imm(asm.R2, -stackReserved),
 		asm.FnMapLookupElem.Call(),
-		asm.JEq.Imm(asm.R0, 0, done), // NULL check, required by the verifier
-		asm.LoadMem(asm.R1, asm.R0, 0, asm.DWord),
+		asm.JEq.Imm(asm.R0, 0, done),              // NULL check, required by the verifier
+		asm.LoadMem(asm.R1, asm.R0, 0, asm.DWord), // Packets
 		asm.Add.Imm(asm.R1, 1),
 		asm.StoreMem(asm.R0, 0, asm.R1, asm.DWord),
+		// The helper call clobbered R2 / R3, so take the length from ctx again.
+		asm.LoadMem(asm.R1, asm.R9, 0, asm.Word), // xdp_md->data
+		asm.LoadMem(asm.R2, asm.R9, 4, asm.Word), // xdp_md->data_end
+		asm.Sub.Reg(asm.R2, asm.R1),
+		asm.LoadMem(asm.R1, asm.R0, 8, asm.DWord), // Bytes
+		asm.Add.Reg(asm.R1, asm.R2),
+		asm.StoreMem(asm.R0, 8, asm.R1, asm.DWord),
 		asm.Mov.Imm(asm.R0, 0).WithSymbol(done), // landing spot for the NULL check
 	}
 }

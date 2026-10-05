@@ -49,9 +49,12 @@ xdpcap -actions pass /sys/fs/bpf/sunet-xdpd/eth0-filter - "" | tcpdump -nr -
 xdpcap /sys/fs/bpf/sunet-xdpd/eth0-monitor - "" | tcpdump -nr -
 ```
 
-Matched packets are counted per filter and are visible in prometheus metrics
-available at 127.0.0.1:2112/metrics, labelled with the interface, description,
-expr, action and whether the filter is in monitor mode, e.g.:
+Matched packets and their bytes are counted per filter and are visible in
+prometheus metrics (`filter_packets_total` and `filter_bytes_total`) available
+at 127.0.0.1:2112/metrics, labelled with the interface, description, expr,
+action and whether the filter is in monitor mode. The bytes are the whole packet
+as XDP sees it, from the link layer header (if the interface has one) up to but
+not including the FCS, e.g.:
 ```
 curl http://127.0.0.1:2112/metrics | grep ^filter
 ```
