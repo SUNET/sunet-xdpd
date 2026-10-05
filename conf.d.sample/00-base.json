@@ -1,27 +1,36 @@
 {
   "interfaces": {
     "lo": {
-      "bpf_drop_filters": [
+      "bpf_filters": [
         {
           "description": "Drop some TCP",
-          "expr": "tcp dst port 1337"
+          "expr": "tcp dst port 1337",
+          "action": "drop"
         },
         {
           "description": "Drop some UDP",
           "expr": "udp dst port 9999",
+          "action": "drop",
           "monitor": true
         }
       ]
     },
     "ens3": {
-      "bpf_drop_filters": [
+      "bpf_filters": [
+        {
+          "description": "Never drop the monitoring host",
+          "expr": "src host 192.0.2.10",
+          "action": "pass"
+        },
         {
           "description": "Drop some TCP",
-          "expr": "tcp dst port 1338"
+          "expr": "tcp dst port 1338",
+          "action": "drop"
         },
         {
           "description": "Drop some UDP",
           "expr": "udp dst port 9998",
+          "action": "drop",
           "monitor": true
         }
       ]

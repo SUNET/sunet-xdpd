@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -60,26 +61,26 @@ func udpPacket(t *testing.T, srcPort, dstPort uint16, payloadLen int) []byte {
 type testProg struct {
 	prog        *ebpf.Program
 	counters    *ebpf.Map
-	dropHook    *xdpcap.Hook
+	filterHook  *xdpcap.Hook
 	monitorHook *xdpcap.Hook
 }
 
-func loadTestProg(t *testing.T, filters []bpfDropFilter) *testProg {
+func loadTestProg(t *testing.T, filters []bpfFilter) *testProg {
 	t.Helper()
 	return loadTestProgFor(t, filters, dltEthernet)
 }
 
-func loadTestProgFor(t *testing.T, filters []bpfDropFilter, linkType layers.LinkType) *testProg {
+func loadTestProgFor(t *testing.T, filters []bpfFilter, linkType layers.LinkType) *testProg {
 	t.Helper()
 
-	dropHook, err := xdpcap.NewHook("/sys/fs/bpf/test_drop") // not pinned
+	filterHook, err := xdpcap.NewHook("/sys/fs/bpf/test_filter") // not pinned
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		cErr := dropHook.Close()
+		cErr := filterHook.Close()
 		if cErr != nil {
-			t.Log("closing drophook failed", cErr)
+			t.Log("closing filterHook failed", cErr)
 		}
 	})
 
@@ -108,7 +109,7 @@ func loadTestProgFor(t *testing.T, filters []bpfDropFilter, linkType layers.Link
 		}
 	})
 
-	insns, err := buildProgram(filters, linkType, dropHook.Map(), monitorHook.Map(), counters)
+	insns, err := buildProgram(filters, linkType, filterHook.Map(), monitorHook.Map(), counters)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +127,7 @@ func loadTestProgFor(t *testing.T, filters []bpfDropFilter, linkType layers.Link
 		}
 	})
 
-	return &testProg{prog, counters, dropHook, monitorHook}
+	return &testProg{prog, counters, filterHook, monitorHook}
 }
 
 func (p *testProg) run(t *testing.T, pkt []byte) uint32 {
@@ -186,9 +187,9 @@ func attachFakeCapture(t *testing.T, hook *xdpcap.Hook, action uint32) {
 	})
 }
 
-var testFilters = []bpfDropFilter{
-	{Description: "udp-9999", Expr: "udp dst port 9999"},
-	{Description: "dns-amp", Expr: "udp src port 53 and len > 1000", Monitor: true},
+var testFilters = []bpfFilter{
+	{Description: "udp-9999", Expr: new("udp dst port 9999"), Action: actionDrop},
+	{Description: "dns-amp", Expr: new("udp src port 53 and len > 1000"), Action: actionDrop, Monitor: true},
 }
 
 func TestVerdictsAndCounters(t *testing.T) {
@@ -215,15 +216,149 @@ func TestVerdictsAndCounters(t *testing.T) {
 	}
 }
 
-func TestDropHook(t *testing.T) {
-	p := loadTestProg(t, testFilters)
-	attachFakeCapture(t, p.dropHook, xdpDrop)
+// Matched packets exit through the filter hook, in the slot for their action,
+// so xdpcap -actions can pick drops or passes. Packets no filter matched pass
+// without going through it.
+func TestFilterHook(t *testing.T) {
+	p := loadTestProg(t, []bpfFilter{
+		{Description: "pass-53", Expr: new("udp src port 53"), Action: actionPass},
+		{Description: "drop-9999", Expr: new("udp dst port 9999"), Action: actionDrop},
+	})
+	dns, drop, unmatched := udpPacket(t, 53, 4321, 10), udpPacket(t, 1234, 9999, 10), udpPacket(t, 1234, 80, 10)
 
-	if got := p.run(t, udpPacket(t, 1234, 9999, 10)); got != xdpTX {
-		t.Errorf("dropped packet didn't exit through drop hook: got %d", got)
+	attachFakeCapture(t, p.filterHook, xdpDrop)
+	if got := p.run(t, drop); got != xdpTX {
+		t.Errorf("dropped packet didn't exit through the filter hook's drop slot: got %d", got)
 	}
-	if got := p.run(t, udpPacket(t, 1234, 80, 10)); got != xdpPass {
-		t.Errorf("passed packet went through drop hook: got %d", got)
+	if got := p.run(t, dns); got != xdpPass {
+		t.Errorf("passed packet went through the filter hook's drop slot: got %d", got)
+	}
+
+	attachFakeCapture(t, p.filterHook, xdpPass)
+	if got := p.run(t, dns); got != xdpTX {
+		t.Errorf("passed packet didn't exit through the filter hook's pass slot: got %d", got)
+	}
+	if got := p.run(t, unmatched); got != xdpPass {
+		t.Errorf("packet no filter matched went through the filter hook: got %d", got)
+	}
+}
+
+// The first filter that matches a packet decides what happens to it, and the
+// filters after it are not looked at, so they don't count it either.
+func TestFirstMatchWins(t *testing.T) {
+	pkt := udpPacket(t, 53, 9999, 10)
+	for _, tc := range []struct {
+		name    string
+		filters []bpfFilter
+		want    uint32
+	}{
+		{"pass then drop", []bpfFilter{
+			{Description: "pass-53", Expr: new("udp src port 53"), Action: actionPass},
+			{Description: "drop-9999", Expr: new("udp dst port 9999"), Action: actionDrop},
+		}, xdpPass},
+		{"drop then pass", []bpfFilter{
+			{Description: "drop-9999", Expr: new("udp dst port 9999"), Action: actionDrop},
+			{Description: "pass-53", Expr: new("udp src port 53"), Action: actionPass},
+		}, xdpDrop},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := loadTestProg(t, tc.filters)
+			// Captured by the hook, a pass would look the same as no match.
+			attachFakeCapture(t, p.monitorHook, xdpPass)
+			if got := p.run(t, pkt); got != tc.want {
+				t.Errorf("got %d, want %d", got, tc.want)
+			}
+			if got := p.count(t, 0); got != 1 {
+				t.Errorf("first filter counter: got %d, want 1", got)
+			}
+			if got := p.count(t, 1); got != 0 {
+				t.Errorf("second filter counter: got %d, want 0", got)
+			}
+		})
+	}
+}
+
+// A filter with an empty expr last on an interface decides for every packet
+// the filters before it didn't match. Passes are captured by the filter hook,
+// so a default pass (a match) can be told from no match.
+func TestDefaultAction(t *testing.T) {
+	dns, other := udpPacket(t, 53, 4321, 10), udpPacket(t, 1234, 80, 10)
+	for _, tc := range []struct {
+		first     bpfFilter
+		def       filterAction
+		wantDNS   uint32
+		wantOther uint32
+	}{
+		{bpfFilter{Description: "pass-53", Expr: new("udp src port 53"), Action: actionPass}, actionDrop, xdpTX, xdpDrop},
+		{bpfFilter{Description: "drop-53", Expr: new("udp src port 53"), Action: actionDrop}, actionPass, xdpDrop, xdpTX},
+	} {
+		t.Run("default "+string(tc.def), func(t *testing.T) {
+			p := loadTestProg(t, []bpfFilter{tc.first, {Description: "default", Expr: new(""), Action: tc.def}})
+			attachFakeCapture(t, p.filterHook, xdpPass)
+
+			if got := p.run(t, dns); got != tc.wantDNS {
+				t.Errorf("dns packet: got %d, want %d", got, tc.wantDNS)
+			}
+			for range 2 {
+				if got := p.run(t, other); got != tc.wantOther {
+					t.Errorf("other packet: got %d, want %d", got, tc.wantOther)
+				}
+			}
+			if got := p.count(t, 0); got != 1 {
+				t.Errorf("first filter counter: got %d, want 1", got)
+			}
+			if got := p.count(t, 1); got != 2 {
+				t.Errorf("default filter counter: got %d, want 2", got)
+			}
+		})
+	}
+}
+
+// Only an empty expr, so the default is all there is.
+func TestOnlyDefaultFilter(t *testing.T) {
+	for action, want := range map[filterAction]uint32{actionDrop: xdpDrop, actionPass: xdpPass} {
+		p := loadTestProg(t, []bpfFilter{{Description: "default", Expr: new(""), Action: action}})
+		if got := p.run(t, udpPacket(t, 1234, 80, 10)); got != want {
+			t.Errorf("default %s: got %d, want %d", action, got, want)
+		}
+		if got := p.count(t, 0); got != 1 {
+			t.Errorf("default %s counter: got %d, want 1", action, got)
+		}
+	}
+}
+
+// A monitor filter only counts, whatever its action: a later filter or the
+// lack of one decides.
+func TestMonitorPassFilter(t *testing.T) {
+	p := loadTestProg(t, []bpfFilter{
+		{Description: "watch-53", Expr: new("udp src port 53"), Action: actionPass, Monitor: true},
+		{Description: "default", Expr: new(""), Action: actionDrop},
+	})
+	if got := p.run(t, udpPacket(t, 53, 4321, 10)); got != xdpDrop {
+		t.Errorf("got %d, want XDP_DROP from the default filter", got)
+	}
+	if got := p.count(t, 0); got != 1 {
+		t.Errorf("monitor counter: got %d, want 1", got)
+	}
+	if got := p.count(t, 1); got != 1 {
+		t.Errorf("default counter: got %d, want 1", got)
+	}
+}
+
+// A filter validate would refuse is refused by buildProgram too, rather than
+// guessed at or panicked on.
+func TestBuildProgramInvalidFilter(t *testing.T) {
+	for _, tc := range []struct {
+		filter bpfFilter
+		want   string
+	}{
+		{bpfFilter{Description: "flood", Expr: new("udp"), source: "50-ddos.json"}, `50-ddos.json: "flood": unknown action ""`},
+		{bpfFilter{Description: "flood", Action: actionDrop, source: "50-ddos.json"}, `50-ddos.json: "flood": no expr`},
+	} {
+		_, err := buildProgram([]bpfFilter{tc.filter}, dltEthernet, nil, nil, nil)
+		if err == nil || err.Error() != tc.want {
+			t.Errorf("got %v, want %q", err, tc.want)
+		}
 	}
 }
 
@@ -240,16 +375,16 @@ func TestMonitorHook(t *testing.T) {
 }
 
 // A packet matching a monitor filter and a later dropping filter is dropped,
-// and exits through the drop hook, not the monitor hook.
+// and exits through the filter hook, not the monitor hook.
 func TestMonitorThenDrop(t *testing.T) {
-	p := loadTestProg(t, []bpfDropFilter{
-		{Description: "watch-53", Expr: "udp src port 53", Monitor: true},
-		{Description: "drop-9999", Expr: "udp dst port 9999"},
+	p := loadTestProg(t, []bpfFilter{
+		{Description: "watch-53", Expr: new("udp src port 53"), Action: actionDrop, Monitor: true},
+		{Description: "drop-9999", Expr: new("udp dst port 9999"), Action: actionDrop},
 	})
 	attachFakeCapture(t, p.monitorHook, xdpPass)
 
 	if got := p.run(t, udpPacket(t, 53, 9999, 10)); got != xdpDrop {
-		t.Errorf("got %d, want XDP_DROP via plain drop exit", got)
+		t.Errorf("got %d, want XDP_DROP via the filter hook", got)
 	}
 	if got := p.count(t, 0); got != 1 {
 		t.Errorf("monitor counter: got %d, want 1", got)
@@ -264,14 +399,14 @@ func TestNoFilters(t *testing.T) {
 }
 
 func TestOnlyMonitorFilters(t *testing.T) {
-	p := loadTestProg(t, []bpfDropFilter{{Description: "watch-53", Expr: "udp src port 53", Monitor: true}})
+	p := loadTestProg(t, []bpfFilter{{Description: "watch-53", Expr: new("udp src port 53"), Action: actionDrop, Monitor: true}})
 	if got := p.run(t, udpPacket(t, 53, 4321, 10)); got != xdpPass {
 		t.Errorf("got %d, want XDP_PASS", got)
 	}
 }
 
 func TestOnlyDropFilters(t *testing.T) {
-	p := loadTestProg(t, []bpfDropFilter{{Description: "drop-9999", Expr: "udp dst port 9999"}})
+	p := loadTestProg(t, []bpfFilter{{Description: "drop-9999", Expr: new("udp dst port 9999"), Action: actionDrop}})
 	if got := p.run(t, udpPacket(t, 1234, 9999, 10)); got != xdpDrop {
 		t.Errorf("got %d, want XDP_DROP", got)
 	}
@@ -289,17 +424,43 @@ func writeConfDir(t *testing.T, files map[string]string) string {
 	return dir
 }
 
-const goodConf = `{"interfaces": {"lo": {"bpf_drop_filters": [{"description": "Drop some UDP port 9999", "expr": "udp dst port 9999"}]}}}`
+const goodConf = `{"interfaces": {"lo": {"bpf_filters": [{"description": "Drop some UDP port 9999", "expr": "udp dst port 9999", "action": "drop"}]}}}`
 
-func wantInterfaces(t *testing.T, conf config, want map[string][]bpfDropFilter) {
+func wantInterfaces(t *testing.T, conf config, want map[string][]bpfFilter) {
 	t.Helper()
-	got := map[string][]bpfDropFilter{}
+	got := map[string][]bpfFilter{}
 	for ifname, ifConf := range conf.Interfaces {
-		got[ifname] = ifConf.BPFDropFilters
+		got[ifname] = ifConf.BPFFilters
 	}
-	if !maps.EqualFunc(got, want, slices.Equal) {
-		t.Errorf("got %+v, want %+v", got, want)
+	if !maps.EqualFunc(got, want, func(a, b []bpfFilter) bool { return slices.EqualFunc(a, b, sameFilter) }) {
+		t.Errorf("got %s, want %s", fmtInterfaces(got), fmtInterfaces(want))
 	}
+}
+
+// fmtInterfaces shows the exprs of the filters rather than their addresses.
+func fmtInterfaces(ifs map[string][]bpfFilter) string {
+	var b strings.Builder
+	for _, ifname := range slices.Sorted(maps.Keys(ifs)) {
+		fmt.Fprintf(&b, "%s: [", ifname)
+		for _, bf := range ifs[ifname] {
+			expr := "<nil>"
+			if bf.Expr != nil {
+				expr = strconv.Quote(*bf.Expr)
+			}
+			fmt.Fprintf(&b, "{%q %s %s monitor=%v %s}", bf.Description, expr, bf.Action, bf.Monitor, bf.source)
+		}
+		b.WriteString("] ")
+	}
+	return b.String()
+}
+
+// sameFilter compares filters by the expr they point to.
+func sameFilter(a, b bpfFilter) bool {
+	if (a.Expr == nil) != (b.Expr == nil) || (a.Expr != nil && *a.Expr != *b.Expr) {
+		return false
+	}
+	a.Expr, b.Expr = nil, nil
+	return a == b
 }
 
 func TestReadConfig(t *testing.T) {
@@ -308,23 +469,23 @@ func TestReadConfig(t *testing.T) {
 {
   "interfaces": {
     "lo": {
-      "bpf_drop_filters": [
+      "bpf_filters": [
         {
           "description": "Drop some UDP port 9999",
-          "expr": "udp dst port 9999"
+          "expr": "udp dst port 9999", "action": "drop"
         },
         {
           "description": "Monitor some large DNS responses",
-          "expr": "udp src port 53 and len > 1000",
+          "expr": "udp src port 53 and len > 1000", "action": "drop",
           "monitor": true
         }
       ]
     },
     "ens3": {
-      "bpf_drop_filters": [
+      "bpf_filters": [
         {
           "description": "Drop some TCP port 1337",
-          "expr": "tcp dst port 1337"
+          "expr": "tcp dst port 1337", "action": "drop"
         }
       ]
     }
@@ -335,10 +496,10 @@ func TestReadConfig(t *testing.T) {
 {
   "interfaces": {
     "lo": {
-      "bpf_drop_filters": [
+      "bpf_filters": [
         {
           "description": "Drop a flood",
-          "expr": "udp dst port 4444"
+          "expr": "udp dst port 4444", "action": "drop"
         }
       ]
     }
@@ -353,14 +514,14 @@ func TestReadConfig(t *testing.T) {
 	}
 
 	// Filters for one interface are appended in file name order.
-	wantInterfaces(t, conf, map[string][]bpfDropFilter{
+	wantInterfaces(t, conf, map[string][]bpfFilter{
 		"lo": {
-			{Description: "Drop some UDP port 9999", Expr: "udp dst port 9999", source: "00-base.json"},
-			{Description: "Monitor some large DNS responses", Expr: "udp src port 53 and len > 1000", Monitor: true, source: "00-base.json"},
-			{Description: "Drop a flood", Expr: "udp dst port 4444", source: "50-ddos.json"},
+			{Description: "Drop some UDP port 9999", Expr: new("udp dst port 9999"), Action: actionDrop, source: "00-base.json"},
+			{Description: "Monitor some large DNS responses", Expr: new("udp src port 53 and len > 1000"), Action: actionDrop, Monitor: true, source: "00-base.json"},
+			{Description: "Drop a flood", Expr: new("udp dst port 4444"), Action: actionDrop, source: "50-ddos.json"},
 		},
 		"ens3": {
-			{Description: "Drop some TCP port 1337", Expr: "tcp dst port 1337", source: "00-base.json"},
+			{Description: "Drop some TCP port 1337", Expr: new("tcp dst port 1337"), Action: actionDrop, source: "00-base.json"},
 		},
 	})
 	if want := []string{"00-base.json", "50-ddos.json"}; !slices.Equal(conf.files, want) {
@@ -376,9 +537,9 @@ func rawUDPPacket(t *testing.T, srcPort, dstPort uint16) []byte {
 }
 
 func TestRawLinkType(t *testing.T) {
-	bpfDropFilters := []bpfDropFilter{{Description: "udp-9999", Expr: "udp dst port 9999"}}
+	bpfFilters := []bpfFilter{{Description: "udp-9999", Expr: new("udp dst port 9999"), Action: actionDrop}}
 
-	raw := loadTestProgFor(t, bpfDropFilters, dltRaw)
+	raw := loadTestProgFor(t, bpfFilters, dltRaw)
 	if got := raw.run(t, rawUDPPacket(t, 1234, 9999)); got != xdpDrop {
 		t.Errorf("raw link type filters, raw packet to 9999: got %d, want XDP_DROP", got)
 	}
@@ -387,7 +548,7 @@ func TestRawLinkType(t *testing.T) {
 	}
 
 	// Ethernet link type filters on a raw packet read every field 14 bytes off: no error, no match.
-	eth := loadTestProg(t, bpfDropFilters)
+	eth := loadTestProg(t, bpfFilters)
 	if got := eth.run(t, rawUDPPacket(t, 1234, 9999)); got != xdpPass {
 		t.Errorf("ethernet link type filters, raw packet: got %d, expected a silent miss (XDP_PASS)", got)
 	}
@@ -435,17 +596,17 @@ func TestReadConfigIgnores(t *testing.T) {
 // Names are sorted as strings, not numbers, as documented.
 func TestReadConfigOrderIsByName(t *testing.T) {
 	dir := writeConfDir(t, map[string]string{
-		"9-a.json":  `{"interfaces": {"lo": {"bpf_drop_filters": [{"description": "a", "expr": "udp dst port 1"}]}}}`,
-		"10-b.json": `{"interfaces": {"lo": {"bpf_drop_filters": [{"description": "b", "expr": "udp dst port 2"}]}}}`,
+		"9-a.json":  `{"interfaces": {"lo": {"bpf_filters": [{"description": "a", "expr": "udp dst port 1", "action": "drop"}]}}}`,
+		"10-b.json": `{"interfaces": {"lo": {"bpf_filters": [{"description": "b", "expr": "udp dst port 2", "action": "drop"}]}}}`,
 	})
 	conf, err := readConf(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantInterfaces(t, conf, map[string][]bpfDropFilter{
+	wantInterfaces(t, conf, map[string][]bpfFilter{
 		"lo": {
-			{Description: "b", Expr: "udp dst port 2", source: "10-b.json"},
-			{Description: "a", Expr: "udp dst port 1", source: "9-a.json"},
+			{Description: "b", Expr: new("udp dst port 2"), Action: actionDrop, source: "10-b.json"},
+			{Description: "a", Expr: new("udp dst port 1"), Action: actionDrop, source: "9-a.json"},
 		},
 	})
 }
@@ -485,15 +646,15 @@ func TestReadConfigEmptyInterface(t *testing.T) {
 	dir := writeConfDir(t, map[string]string{
 		"00-base.json":  `{"interfaces": {"lo": {}}}`,
 		"50-ddos.json":  goodConf,
-		"60-ens3.json":  `{"interfaces": {"ens3": {"bpf_drop_filters": []}}}`,
+		"60-ens3.json":  `{"interfaces": {"ens3": {"bpf_filters": []}}}`,
 		"70-empty.json": `{}`,
 	})
 	conf, err := readConf(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantInterfaces(t, conf, map[string][]bpfDropFilter{
-		"lo":   {{Description: "Drop some UDP port 9999", Expr: "udp dst port 9999", source: "50-ddos.json"}},
+	wantInterfaces(t, conf, map[string][]bpfFilter{
+		"lo":   {{Description: "Drop some UDP port 9999", Expr: new("udp dst port 9999"), Action: actionDrop, source: "50-ddos.json"}},
 		"ens3": nil,
 	})
 	if want := []string{"00-base.json", "50-ddos.json", "60-ens3.json", "70-empty.json"}; !slices.Equal(conf.files, want) {
@@ -519,8 +680,8 @@ func TestReadConfigDuplicateAcrossFiles(t *testing.T) {
 func TestConfigFileCounts(t *testing.T) {
 	dir := writeConfDir(t, map[string]string{
 		"00-base.json": `{"interfaces": {
-			"lo": {"bpf_drop_filters": [{"description": "a", "expr": "udp dst port 1"}]},
-			"ens3": {"bpf_drop_filters": [{"description": "b", "expr": "udp dst port 2"}]}
+			"lo": {"bpf_filters": [{"description": "a", "expr": "udp dst port 1", "action": "drop"}]},
+			"ens3": {"bpf_filters": [{"description": "b", "expr": "udp dst port 2", "action": "drop"}]}
 		}}`,
 		"50-ddos.json":  goodConf,
 		"60-empty.json": `{}`,
@@ -549,10 +710,10 @@ func TestReadConfigInvalid(t *testing.T) {
 		{"broken json", map[string]string{"00-base.json": goodConf, "50-ddos.json": `{"interfaces": {`}, "parsing 50-ddos.json: "},
 		{"zero bytes", map[string]string{"50-ddos.json": ""}, "parsing 50-ddos.json: jsontext: unexpected EOF"},
 		{"unknown top level field", map[string]string{"50-ddos.json": `{"interface": {}}`}, `unknown object member name "interface"`},
-		{"typo in a filter", map[string]string{"50-ddos.json": `{"interfaces": {"lo": {"bpf_drop_filters": [{"description": "d", "expr": "udp", "monitr": true}]}}}`}, `unknown object member name "monitr" within "/interfaces/lo/bpf_drop_filters/0"`},
+		{"typo in a filter", map[string]string{"50-ddos.json": `{"interfaces": {"lo": {"bpf_filters": [{"description": "d", "expr": "udp", "action": "drop", "monitr": true}]}}}`}, `unknown object member name "monitr" within "/interfaces/lo/bpf_filters/0"`},
 		// v1 matched names ignoring case; v2 doesn't, so this is an unknown field.
-		{"wrong case", map[string]string{"50-ddos.json": `{"interfaces": {"lo": {"bpf_drop_filters": [{"description": "d", "expr": "udp", "Monitor": true}]}}}`}, `unknown object member name "Monitor"`},
-		{"field twice in a filter", map[string]string{"50-ddos.json": `{"interfaces": {"lo": {"bpf_drop_filters": [{"description": "d", "expr": "udp", "expr": "tcp"}]}}}`}, `duplicate object member name "expr"`},
+		{"wrong case", map[string]string{"50-ddos.json": `{"interfaces": {"lo": {"bpf_filters": [{"description": "d", "expr": "udp", "action": "drop", "Monitor": true}]}}}`}, `unknown object member name "Monitor"`},
+		{"field twice in a filter", map[string]string{"50-ddos.json": `{"interfaces": {"lo": {"bpf_filters": [{"description": "d", "expr": "udp", "action": "drop", "expr": "tcp", "action": "drop"}]}}}`}, `duplicate object member name "expr"`},
 		// v1 would silently keep only the last one, losing the first one's filters.
 		{"interface twice in a file", map[string]string{"50-ddos.json": `{"interfaces": {"lo": {}, "lo": {}}}`}, `duplicate object member name "lo" within "/interfaces"`},
 		{"trailing data", map[string]string{"50-ddos.json": `{} {}`}, "parsing 50-ddos.json: jsontext: invalid character '{' after top-level value"},
@@ -640,8 +801,8 @@ func newTestXdpd(t *testing.T) (*xdpd, string) {
 	return xd, ifname
 }
 
-func confFor(ifname string, bpfDropFilters ...bpfDropFilter) config {
-	return config{Interfaces: map[string]interfaceConfig{ifname: {BPFDropFilters: bpfDropFilters}}}
+func confFor(ifname string, bpfFilters ...bpfFilter) config {
+	return config{Interfaces: map[string]interfaceConfig{ifname: {BPFFilters: bpfFilters}}}
 }
 
 // liveProg returns the IDs of the link on f and of the program it runs.
@@ -670,7 +831,7 @@ func TestApplyBadConfigKeepsRunning(t *testing.T) {
 	requireRoot(t)
 	xd, ifname := newTestXdpd(t)
 
-	if err := xd.apply(confFor(ifname, bpfDropFilter{Description: "good", Expr: "udp dst port 9999"})); err != nil {
+	if err := xd.apply(confFor(ifname, bpfFilter{Description: "good", Expr: new("udp dst port 9999"), Action: actionDrop})); err != nil {
 		t.Fatal(err)
 	}
 	f := xd.filters[ifname]
@@ -678,8 +839,8 @@ func TestApplyBadConfigKeepsRunning(t *testing.T) {
 
 	err := xd.apply(confFor(
 		ifname,
-		bpfDropFilter{Description: "good", Expr: "udp dst port 9999"},
-		bpfDropFilter{Description: "bad", Expr: "this is ((not a filter"},
+		bpfFilter{Description: "good", Expr: new("udp dst port 9999"), Action: actionDrop},
+		bpfFilter{Description: "bad", Expr: new("this is ((not a filter"), Action: actionDrop},
 	))
 	if err == nil {
 		t.Fatal("expected an error for an invalid expression")
@@ -691,8 +852,8 @@ func TestApplyBadConfigKeepsRunning(t *testing.T) {
 	if gotLink, gotProg := liveProg(t, f); gotLink != linkID || gotProg != progID {
 		t.Errorf("failed apply changed what is attached: link %d -> %d, prog %d -> %d", linkID, gotLink, progID, gotProg)
 	}
-	if len(f.bpfDropFilters) != 1 {
-		t.Errorf("got %d filters recorded for the running program, want 1", len(f.bpfDropFilters))
+	if len(f.bpfFilters) != 1 {
+		t.Errorf("got %d filters recorded for the running program, want 1", len(f.bpfFilters))
 	}
 }
 
@@ -700,7 +861,7 @@ func TestApplyUpdatesInPlace(t *testing.T) {
 	requireRoot(t)
 	xd, ifname := newTestXdpd(t)
 
-	if err := xd.apply(confFor(ifname, bpfDropFilter{Description: "one", Expr: "udp dst port 9999"})); err != nil {
+	if err := xd.apply(confFor(ifname, bpfFilter{Description: "one", Expr: new("udp dst port 9999"), Action: actionDrop})); err != nil {
 		t.Fatal(err)
 	}
 	f := xd.filters[ifname]
@@ -708,8 +869,8 @@ func TestApplyUpdatesInPlace(t *testing.T) {
 
 	if err := xd.apply(confFor(
 		ifname,
-		bpfDropFilter{Description: "one", Expr: "udp dst port 9999"},
-		bpfDropFilter{Description: "two", Expr: "udp dst port 9998", Monitor: true},
+		bpfFilter{Description: "one", Expr: new("udp dst port 9999"), Action: actionDrop},
+		bpfFilter{Description: "two", Expr: new("udp dst port 9998"), Action: actionDrop, Monitor: true},
 	)); err != nil {
 		t.Fatal(err)
 	}
@@ -721,8 +882,8 @@ func TestApplyUpdatesInPlace(t *testing.T) {
 	if gotProg == progID {
 		t.Error("program was not replaced")
 	}
-	if len(f.bpfDropFilters) != 2 {
-		t.Errorf("got %d filters, want 2", len(f.bpfDropFilters))
+	if len(f.bpfFilters) != 2 {
+		t.Errorf("got %d filters, want 2", len(f.bpfFilters))
 	}
 }
 
@@ -730,7 +891,7 @@ func TestApplyRemovedInterface(t *testing.T) {
 	requireRoot(t)
 	xd, ifname := newTestXdpd(t)
 
-	if err := xd.apply(confFor(ifname, bpfDropFilter{Description: "one", Expr: "udp dst port 9999"})); err != nil {
+	if err := xd.apply(confFor(ifname, bpfFilter{Description: "one", Expr: new("udp dst port 9999"), Action: actionDrop})); err != nil {
 		t.Fatal(err)
 	}
 	for _, kind := range pinKinds {
@@ -760,13 +921,13 @@ func TestApplyTakesOverPinnedLink(t *testing.T) {
 	requireRoot(t)
 	first, ifname := newTestXdpd(t)
 
-	if err := first.apply(confFor(ifname, bpfDropFilter{Description: "one", Expr: "udp dst port 9999"})); err != nil {
+	if err := first.apply(confFor(ifname, bpfFilter{Description: "one", Expr: new("udp dst port 9999"), Action: actionDrop})); err != nil {
 		t.Fatal(err)
 	}
 	linkID, _ := liveProg(t, first.filters[ifname])
 
 	second := newXdpd("unused", first.pinDir, first.logger)
-	if err := second.apply(confFor(ifname, bpfDropFilter{Description: "two", Expr: "udp dst port 9998"})); err != nil {
+	if err := second.apply(confFor(ifname, bpfFilter{Description: "two", Expr: new("udp dst port 9998"), Action: actionDrop})); err != nil {
 		t.Fatal(err)
 	}
 	f := second.filters[ifname]
@@ -785,7 +946,7 @@ func TestUnloadAllWithoutConfig(t *testing.T) {
 	requireRoot(t)
 	xd, ifname := newTestXdpd(t)
 
-	if err := xd.apply(confFor(ifname, bpfDropFilter{Description: "one", Expr: "udp dst port 9999"})); err != nil {
+	if err := xd.apply(confFor(ifname, bpfFilter{Description: "one", Expr: new("udp dst port 9999"), Action: actionDrop})); err != nil {
 		t.Fatal(err)
 	}
 
@@ -818,8 +979,8 @@ func TestUnloadAllNothingPinned(t *testing.T) {
 	}
 }
 
-// filterHits returns what prometheus would report for bpfDropFilter on ifname.
-func filterHits(t *testing.T, xd *xdpd, ifname string, bdf bpfDropFilter) float64 {
+// filterHits returns what prometheus would report for bpfFilter on ifname.
+func filterHits(t *testing.T, xd *xdpd, ifname string, bf bpfFilter) float64 {
 	t.Helper()
 
 	families, err := xd.reg.Gather()
@@ -835,7 +996,7 @@ func filterHits(t *testing.T, xd *xdpd, ifname string, bdf bpfDropFilter) float6
 			for _, l := range m.GetLabel() {
 				labels[l.GetName()] = l.GetValue()
 			}
-			if labels["iface"] == ifname && labels["description"] == bdf.Description {
+			if labels["iface"] == ifname && labels["description"] == bf.Description {
 				return m.GetCounter().GetValue()
 			}
 		}
@@ -859,20 +1020,71 @@ func sendUDP9999(t *testing.T, f *filter, n int) {
 	}
 }
 
+// Every filter gets a series labelled with its action and whether it is in
+// monitor mode, read from the counter at its position.
+func TestMetricLabels(t *testing.T) {
+	requireRoot(t)
+	xd, ifname := newTestXdpd(t)
+
+	if err := xd.apply(confFor(
+		ifname,
+		bpfFilter{Description: "watch-9999", Expr: new("udp dst port 9999"), Action: actionDrop, Monitor: true},
+		bpfFilter{Description: "pass-9999", Expr: new("udp dst port 9999"), Action: actionPass},
+		bpfFilter{Description: "default", Expr: new(""), Action: actionDrop},
+	)); err != nil {
+		t.Fatal(err)
+	}
+	ret, err := xd.filters[ifname].prog.Run(&ebpf.RunOptions{Data: udpPacket(t, 1234, 9999, 10)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ret != xdpPass {
+		t.Fatalf("got %d, want XDP_PASS", ret)
+	}
+	xd.updateMetrics()
+
+	families, err := xd.reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]float64{}
+	for _, family := range families {
+		if family.GetName() != "filter_packets_total" {
+			continue
+		}
+		for _, m := range family.GetMetric() {
+			var labels []string
+			for _, l := range m.GetLabel() {
+				labels = append(labels, l.GetName()+"="+l.GetValue())
+			}
+			got[strings.Join(labels, ",")] = m.GetCounter().GetValue()
+		}
+	}
+	// Gather sorts the labels by name.
+	want := map[string]float64{
+		"action=drop,description=watch-9999,expr=udp dst port 9999,iface=" + ifname + ",monitor=true": 1,
+		"action=pass,description=pass-9999,expr=udp dst port 9999,iface=" + ifname + ",monitor=false": 1,
+		"action=drop,description=default,expr=,iface=" + ifname + ",monitor=false":                    0,
+	}
+	if !maps.Equal(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
 // What the old program counted since the last updateMetrics must not be lost
 // when a reload replaces it (and its counters).
 func TestApplyKeepsCountsOfReplacedProgram(t *testing.T) {
 	requireRoot(t)
 	xd, ifname := newTestXdpd(t)
 
-	drop := bpfDropFilter{Description: "one", Expr: "udp dst port 9999"}
+	drop := bpfFilter{Description: "one", Expr: new("udp dst port 9999"), Action: actionDrop}
 	if err := xd.apply(confFor(ifname, drop)); err != nil {
 		t.Fatal(err)
 	}
 	sendUDP9999(t, xd.filters[ifname], 3)
 
 	// No updateMetrics in between, like for packets arriving while apply runs.
-	if err := xd.apply(confFor(ifname, drop, bpfDropFilter{Description: "two", Expr: "udp dst port 9998"})); err != nil {
+	if err := xd.apply(confFor(ifname, drop, bpfFilter{Description: "two", Expr: new("udp dst port 9998"), Action: actionDrop})); err != nil {
 		t.Fatal(err)
 	}
 	if got := filterHits(t, xd, ifname, drop); got != 3 {
@@ -897,7 +1109,7 @@ func TestApplyKeepsCountsOfRemovedInterface(t *testing.T) {
 	requireRoot(t)
 	xd, ifname := newTestXdpd(t)
 
-	drop := bpfDropFilter{Description: "one", Expr: "udp dst port 9999"}
+	drop := bpfFilter{Description: "one", Expr: new("udp dst port 9999"), Action: actionDrop}
 	if err := xd.apply(confFor(ifname, drop)); err != nil {
 		t.Fatal(err)
 	}
@@ -918,16 +1130,16 @@ func TestApplyRemovedInterfacePinCleanupFails(t *testing.T) {
 	requireRoot(t)
 	xd, ifname := newTestXdpd(t)
 
-	if err := xd.apply(confFor(ifname, bpfDropFilter{Description: "one", Expr: "udp dst port 9999"})); err != nil {
+	if err := xd.apply(confFor(ifname, bpfFilter{Description: "one", Expr: new("udp dst port 9999"), Action: actionDrop})); err != nil {
 		t.Fatal(err)
 	}
 
-	// Make the drop hook pin impossible to remove, a directory that is not empty.
-	dropPin := pinPath(xd.pinDir, ifname, "drop")
-	if err := os.Remove(dropPin); err != nil {
+	// Make the filter hook pin impossible to remove, a directory that is not empty.
+	filterPin := pinPath(xd.pinDir, ifname, "filter")
+	if err := os.Remove(filterPin); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Mkdir(dropPin, 0o700); err != nil {
+	if err := os.Mkdir(filterPin, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	m, err := ebpf.NewMap(&ebpf.MapSpec{Type: ebpf.Array, KeySize: 4, ValueSize: 4, MaxEntries: 1})
@@ -939,7 +1151,7 @@ func TestApplyRemovedInterfacePinCleanupFails(t *testing.T) {
 			t.Log("closing map failed", err)
 		}
 	})
-	if err := m.Pin(filepath.Join(dropPin, "blocker")); err != nil {
+	if err := m.Pin(filepath.Join(filterPin, "blocker")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1002,12 +1214,12 @@ func TestApplyRollsBackWhenALaterSwapFails(t *testing.T) {
 	ifC := newDummyInterface(t, "c")
 	blockXDP(t, ifB)
 
-	one := bpfDropFilter{Description: "one", Expr: "udp dst port 9999"}
-	two := bpfDropFilter{Description: "two", Expr: "udp dst port 9998"}
+	one := bpfFilter{Description: "one", Expr: new("udp dst port 9999"), Action: actionDrop}
+	two := bpfFilter{Description: "two", Expr: new("udp dst port 9998"), Action: actionDrop}
 
 	err := xd.apply(config{Interfaces: map[string]interfaceConfig{
-		ifA: {BPFDropFilters: []bpfDropFilter{one}},
-		ifC: {BPFDropFilters: []bpfDropFilter{one}},
+		ifA: {BPFFilters: []bpfFilter{one}},
+		ifC: {BPFFilters: []bpfFilter{one}},
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -1019,8 +1231,8 @@ func TestApplyRollsBackWhenALaterSwapFails(t *testing.T) {
 	// Interfaces are handled in name order: A is swapped, then B fails. C is
 	// no longer in the config but must still be there afterwards.
 	err = xd.apply(config{Interfaces: map[string]interfaceConfig{
-		ifA: {BPFDropFilters: []bpfDropFilter{one, two}},
-		ifB: {BPFDropFilters: []bpfDropFilter{one}},
+		ifA: {BPFFilters: []bpfFilter{one, two}},
+		ifB: {BPFFilters: []bpfFilter{one}},
 	}})
 	if err == nil {
 		t.Fatal("expected an error since XDP can't be attached to the second interface")
@@ -1032,8 +1244,8 @@ func TestApplyRollsBackWhenALaterSwapFails(t *testing.T) {
 	if gotLink, gotProg := liveProg(t, fA); gotLink != linkA || gotProg != progA {
 		t.Errorf("%s: not put back: link %d -> %d, prog %d -> %d", ifA, linkA, gotLink, progA, gotProg)
 	}
-	if len(fA.bpfDropFilters) != 1 {
-		t.Errorf("%s: got %d filters recorded for the running program, want 1", ifA, len(fA.bpfDropFilters))
+	if len(fA.bpfFilters) != 1 {
+		t.Errorf("%s: got %d filters recorded for the running program, want 1", ifA, len(fA.bpfFilters))
 	}
 	if gotLink, gotProg := liveProg(t, fC); gotLink != linkC || gotProg != progC {
 		t.Errorf("%s: changed although it was not part of the new config", ifC)
@@ -1068,7 +1280,7 @@ func recreateDummyInterface(t *testing.T, ifname string) {
 func TestApplyRecreatedInterfaceAttachFails(t *testing.T) {
 	requireRoot(t)
 	xd, ifname := newTestXdpd(t)
-	conf := confFor(ifname, bpfDropFilter{Description: "one", Expr: "udp dst port 9999"})
+	conf := confFor(ifname, bpfFilter{Description: "one", Expr: new("udp dst port 9999"), Action: actionDrop})
 
 	if err := xd.apply(conf); err != nil {
 		t.Fatal(err)
@@ -1087,7 +1299,7 @@ func TestApplyRecreatedInterfaceAttachFails(t *testing.T) {
 		t.Errorf("%s looks unloaded", pin)
 	}
 	// The interface is still in the config, so its hooks stay for xdpcap.
-	for _, kind := range []string{"drop", "monitor"} {
+	for _, kind := range []string{"filter", "monitor"} {
 		if _, err := os.Stat(pinPath(xd.pinDir, ifname, kind)); err != nil {
 			t.Errorf("%s hook pin removed: %v", kind, err)
 		}
@@ -1111,7 +1323,7 @@ func TestApplyBadConfigLeavesNoPinsForNewInterface(t *testing.T) {
 	requireRoot(t)
 	xd, ifname := newTestXdpd(t)
 
-	if err := xd.apply(confFor(ifname, bpfDropFilter{Description: "bad", Expr: "this is ((not a filter"})); err == nil {
+	if err := xd.apply(confFor(ifname, bpfFilter{Description: "bad", Expr: new("this is ((not a filter"), Action: actionDrop})); err == nil {
 		t.Fatal("expected an error for an invalid expression")
 	}
 
@@ -1129,16 +1341,16 @@ func TestApplyBadConfigKeepsHookPinsFromPreviousRun(t *testing.T) {
 	requireRoot(t)
 	first, ifname := newTestXdpd(t)
 
-	if err := first.apply(confFor(ifname, bpfDropFilter{Description: "one", Expr: "udp dst port 9999"})); err != nil {
+	if err := first.apply(confFor(ifname, bpfFilter{Description: "one", Expr: new("udp dst port 9999"), Action: actionDrop})); err != nil {
 		t.Fatal(err)
 	}
 
 	second := newXdpd("unused", first.pinDir, first.logger)
-	if err := second.apply(confFor(ifname, bpfDropFilter{Description: "bad", Expr: "this is ((not a filter"})); err == nil {
+	if err := second.apply(confFor(ifname, bpfFilter{Description: "bad", Expr: new("this is ((not a filter"), Action: actionDrop})); err == nil {
 		t.Fatal("expected an error for an invalid expression")
 	}
 
-	for _, kind := range []string{"drop", "monitor"} {
+	for _, kind := range []string{"filter", "monitor"} {
 		if _, err := os.Stat(pinPath(first.pinDir, ifname, kind)); err != nil {
 			t.Errorf("%s hook pin from the previous run is gone: %v", kind, err)
 		}
@@ -1153,7 +1365,7 @@ func TestApplyRollsBackTakeover(t *testing.T) {
 	ifB := newDummyInterface(t, "b")
 	blockXDP(t, ifB)
 
-	one := bpfDropFilter{Description: "one", Expr: "udp dst port 9999"}
+	one := bpfFilter{Description: "one", Expr: new("udp dst port 9999"), Action: actionDrop}
 	if err := first.apply(confFor(ifA, one)); err != nil {
 		t.Fatal(err)
 	}
@@ -1162,8 +1374,8 @@ func TestApplyRollsBackTakeover(t *testing.T) {
 	// A new process: A is taken over and swapped, then B fails.
 	second := newXdpd("unused", first.pinDir, first.logger)
 	err := second.apply(config{Interfaces: map[string]interfaceConfig{
-		ifA: {BPFDropFilters: []bpfDropFilter{one, {Description: "two", Expr: "udp dst port 9998"}}},
-		ifB: {BPFDropFilters: []bpfDropFilter{one}},
+		ifA: {BPFFilters: []bpfFilter{one, {Description: "two", Expr: new("udp dst port 9998"), Action: actionDrop}}},
+		ifB: {BPFFilters: []bpfFilter{one}},
 	}})
 	if err == nil {
 		t.Fatal("expected an error since XDP can't be attached to the second interface")
@@ -1184,7 +1396,7 @@ func TestDetachPinnedLinkAlreadyDetached(t *testing.T) {
 	requireRoot(t)
 	xd, ifname := newTestXdpd(t)
 
-	if err := xd.apply(confFor(ifname, bpfDropFilter{Description: "one", Expr: "udp dst port 9999"})); err != nil {
+	if err := xd.apply(confFor(ifname, bpfFilter{Description: "one", Expr: new("udp dst port 9999"), Action: actionDrop})); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1210,8 +1422,8 @@ func TestApplyTracksSwapThatCouldNotBePutBack(t *testing.T) {
 	ifB := newDummyInterface(t, "b")
 	blockXDP(t, ifB)
 
-	one := bpfDropFilter{Description: "one", Expr: "udp dst port 9999"}
-	two := bpfDropFilter{Description: "two", Expr: "udp dst port 9998"}
+	one := bpfFilter{Description: "one", Expr: new("udp dst port 9999"), Action: actionDrop}
+	two := bpfFilter{Description: "two", Expr: new("udp dst port 9998"), Action: actionDrop}
 	if err := xd.apply(confFor(ifA, one)); err != nil {
 		t.Fatal(err)
 	}
@@ -1223,15 +1435,15 @@ func TestApplyTracksSwapThatCouldNotBePutBack(t *testing.T) {
 	}
 
 	err := xd.apply(config{Interfaces: map[string]interfaceConfig{
-		ifA: {BPFDropFilters: []bpfDropFilter{one, two}},
-		ifB: {BPFDropFilters: []bpfDropFilter{one}},
+		ifA: {BPFFilters: []bpfFilter{one, two}},
+		ifB: {BPFFilters: []bpfFilter{one}},
 	}})
 	if err == nil {
 		t.Fatal("expected an error")
 	}
 
-	if xd.filters[ifA] != f || len(f.bpfDropFilters) != 2 {
-		t.Errorf("%s: not tracked as running the new filters (%d recorded)", ifA, len(f.bpfDropFilters))
+	if xd.filters[ifA] != f || len(f.bpfFilters) != 2 {
+		t.Errorf("%s: not tracked as running the new filters (%d recorded)", ifA, len(f.bpfFilters))
 	}
 	info, err := f.prog.Info()
 	if err != nil {
@@ -1275,7 +1487,7 @@ func TestRemovedPinWithoutFilters(t *testing.T) {
 func TestApplyReattachesDetachedLinkWithSameIfindex(t *testing.T) {
 	requireRoot(t)
 	xd, ifname := newTestXdpd(t)
-	conf := confFor(ifname, bpfDropFilter{Description: "one", Expr: "udp dst port 9999"})
+	conf := confFor(ifname, bpfFilter{Description: "one", Expr: new("udp dst port 9999"), Action: actionDrop})
 
 	if err := xd.apply(conf); err != nil {
 		t.Fatal(err)
@@ -1313,7 +1525,7 @@ func TestApplyRemovesOrphans(t *testing.T) {
 	requireRoot(t)
 	first, ifname := newTestXdpd(t)
 
-	if err := first.apply(confFor(ifname, bpfDropFilter{Description: "one", Expr: "udp dst port 9999"})); err != nil {
+	if err := first.apply(confFor(ifname, bpfFilter{Description: "one", Expr: new("udp dst port 9999"), Action: actionDrop})); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1341,7 +1553,7 @@ func TestPinOwner(t *testing.T) {
 	for name, want := range map[string]string{
 		"eth0-link":        "eth0",
 		"br-lan-counters":  "br-lan",
-		"wg0-drop":         "wg0",
+		"wg0-filter":       "wg0",
 		"eth0.100-monitor": "eth0.100",
 		"something-else":   "",
 		"-link":            "",
@@ -1354,15 +1566,20 @@ func TestPinOwner(t *testing.T) {
 }
 
 func TestConfigValidateDuplicates(t *testing.T) {
-	one := bpfDropFilter{Description: "one", Expr: "udp dst port 9999", source: "00-base.json"}
-	monitorOne := bpfDropFilter{Description: "one", Expr: "udp dst port 9999", Monitor: true, source: "00-base.json"}
+	one := bpfFilter{Description: "one", Expr: new("udp dst port 9999"), Action: actionDrop, source: "00-base.json"}
+	monitorOne := bpfFilter{Description: "one", Expr: new("udp dst port 9999"), Action: actionDrop, Monitor: true, source: "00-base.json"}
 
 	if err := confFor("eth0", one, monitorOne).validate(); err != nil {
 		t.Errorf("drop and monitor versions of one filter: %v", err)
 	}
+	passOne := one
+	passOne.Action = actionPass
+	if err := confFor("eth0", passOne, one).validate(); err != nil {
+		t.Errorf("pass and drop versions of one filter: %v", err)
+	}
 	if err := (config{Interfaces: map[string]interfaceConfig{
-		"eth0": {BPFDropFilters: []bpfDropFilter{one}},
-		"eth1": {BPFDropFilters: []bpfDropFilter{one}},
+		"eth0": {BPFFilters: []bpfFilter{one}},
+		"eth1": {BPFFilters: []bpfFilter{one}},
 	}}).validate(); err != nil {
 		t.Errorf("one filter on two interfaces: %v", err)
 	}
@@ -1390,37 +1607,96 @@ func TestConfigValidateDuplicates(t *testing.T) {
 	}
 }
 
-// An empty expr compiles to "match everything", so a drop filter without one
-// (e.g. from a generator with an empty template variable) would drop all
-// traffic on the interface.
-func TestConfigValidateEmptyExpr(t *testing.T) {
-	for _, expr := range []string{"", " \t\n"} {
-		bdf := bpfDropFilter{Description: "flood", Expr: expr, source: "50-ddos.json"}
-		want := `eth0: filter "flood" in 50-ddos.json has an empty expr`
-		if err := confFor("eth0", bdf).validate(); err == nil || err.Error() != want {
-			t.Errorf("expr %q: got %v, want %q", expr, err, want)
-		}
-	}
-
-	// A missing expr, or a null entry in the list, ends up the same.
-	for _, content := range []string{
-		`{"interfaces": {"lo": {"bpf_drop_filters": [{"description": "flood"}]}}}`,
-		`{"interfaces": {"lo": {"bpf_drop_filters": [null]}}}`,
+// "action" and "expr" have no defaults: a filter without one is more likely
+// from a broken writer than intended, and guessing would drop or pass all
+// traffic on the interface. A null entry in the list is refused too.
+func TestConfigValidateRequiredFields(t *testing.T) {
+	for _, tc := range []struct {
+		name, filter, want string
+	}{
+		{"no action", `{"description": "d", "expr": "udp"}`, `lo: filter "d" in 50-ddos.json has no action`},
+		{"empty action", `{"description": "d", "expr": "udp", "action": ""}`, `lo: filter "d" in 50-ddos.json has no action`},
+		{"no expr", `{"description": "d", "action": "drop"}`, `lo: filter "d" in 50-ddos.json has no expr`},
+		{"null expr", `{"description": "d", "expr": null, "action": "drop"}`, `lo: filter "d" in 50-ddos.json has no expr`},
+		{"unknown action", `{"description": "d", "expr": "udp", "action": "reject"}`, `lo: filter "d" in 50-ddos.json: action must be "drop" or "pass", not "reject"`},
+		{"action in the wrong case", `{"description": "d", "expr": "udp", "action": "Drop"}`, `lo: filter "d" in 50-ddos.json: action must be "drop" or "pass", not "Drop"`},
+		{"null filter", `null`, `lo: filter "" in 50-ddos.json has no expr`},
 	} {
-		conf, err := readConf(writeConfDir(t, map[string]string{"50-ddos.json": content}))
+		t.Run(tc.name, func(t *testing.T) {
+			content := `{"interfaces": {"lo": {"bpf_filters": [` + tc.filter + `]}}}`
+			conf, err := readConf(writeConfDir(t, map[string]string{"50-ddos.json": content}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := conf.validate(); err == nil || err.Error() != tc.want {
+				t.Errorf("got %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// An empty expr matches every packet, which makes a default drop or pass
+// filter.
+func TestReadConfigCatchAll(t *testing.T) {
+	for _, action := range []filterAction{actionDrop, actionPass} {
+		content := fmt.Sprintf(`{"interfaces": {"lo": {"bpf_filters": [
+			{"description": "pass dns", "expr": "udp port 53", "action": "pass"},
+			{"description": "default", "expr": "", "action": %q}
+		]}}}`, action)
+		conf, err := readConf(writeConfDir(t, map[string]string{"99-default.json": content}))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := conf.validate(); err == nil || !strings.Contains(err.Error(), "in 50-ddos.json has an empty expr") {
-			t.Errorf("%s: got %v, want an empty expr error", content, err)
+		if err := conf.validate(); err != nil {
+			t.Errorf("default %s: %v", action, err)
 		}
+		wantInterfaces(t, conf, map[string][]bpfFilter{
+			"lo": {
+				{Description: "pass dns", Expr: new("udp port 53"), Action: actionPass, source: "99-default.json"},
+				{Description: "default", Expr: new(""), Action: action, source: "99-default.json"},
+			},
+		})
+	}
+}
+
+// The first filter that matches decides, so nothing after a filter with an
+// empty expr is ever looked at. That is refused rather than leaving filters
+// from a later file silently dead.
+func TestConfigValidateUnreachable(t *testing.T) {
+	later := bpfFilter{Description: "flood", Expr: new("udp dst port 4444"), Action: actionDrop, source: "50-ddos.json"}
+	for _, expr := range []string{"", " \t\n"} {
+		for _, action := range []filterAction{actionDrop, actionPass} {
+			catchAll := bpfFilter{Description: "default", Expr: new(expr), Action: action, source: "00-base.json"}
+			want := `eth0: filter "flood" in 50-ddos.json can never match: it comes after filter "default" in 00-base.json, which has an empty expr and so matches everything`
+			if err := confFor("eth0", catchAll, later).validate(); err == nil || err.Error() != want {
+				t.Errorf("expr %q, action %s: got %v, want %q", expr, action, err, want)
+			}
+			if err := confFor("eth0", later, catchAll).validate(); err != nil {
+				t.Errorf("expr %q, action %s, catch-all last: %v", expr, action, err)
+			}
+
+			// A monitor filter never decides, so evaluation goes on after it.
+			catchAll.Monitor = true
+			if err := confFor("eth0", catchAll, later).validate(); err != nil {
+				t.Errorf("expr %q, action %s, monitor catch-all first: %v", expr, action, err)
+			}
+		}
+	}
+
+	// Only filters on the same interface are affected.
+	catchAll := bpfFilter{Description: "default", Expr: new(""), Action: actionDrop, source: "00-base.json"}
+	if err := (config{Interfaces: map[string]interfaceConfig{
+		"eth0": {BPFFilters: []bpfFilter{catchAll}},
+		"eth1": {BPFFilters: []bpfFilter{later}},
+	}}).validate(); err != nil {
+		t.Errorf("catch-all on another interface: %v", err)
 	}
 }
 
 // A filter that doesn't compile names the file it came from, so the writer
 // that broke a reload can be found.
 func TestBuildProgramErrorNamesSource(t *testing.T) {
-	bad := []bpfDropFilter{{Description: "Block flood", Expr: "not a filter", source: "50-ddos.json"}}
+	bad := []bpfFilter{{Description: "Block flood", Expr: new("not a filter"), Action: actionDrop, source: "50-ddos.json"}}
 	// Fails on the first filter, before any of the (nil) maps are used.
 	_, err := buildProgram(bad, dltEthernet, nil, nil, nil)
 	want := `50-ddos.json: "Block flood": compiling "not a filter": `
@@ -1473,7 +1749,7 @@ func TestApplyRefusesNonXDPPinnedLink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = xd.apply(confFor(ifname, bpfDropFilter{Description: "one", Expr: "udp dst port 9999"}))
+	err = xd.apply(confFor(ifname, bpfFilter{Description: "one", Expr: new("udp dst port 9999"), Action: actionDrop}))
 	if err == nil || !strings.Contains(err.Error(), "is not an XDP link") {
 		t.Fatalf("got %v, want the non-XDP link to be refused", err)
 	}

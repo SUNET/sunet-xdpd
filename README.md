@@ -1,8 +1,9 @@
 # sunet-xdpd
 
 This is a daemon that reads config files that describe BPF (tcpdump) filter
-expressions that should be applied to a network interface via XDP, and when the
-filter is matched the matching packet is dropped.
+expressions that should be applied to a network interface via XDP. Each filter
+has an action, `drop` or `pass`, which is what happens to a packet the filter
+matches.
 
 The tool relies heavily on the Cloudflare
 [cbpfc](https://github.com/cloudflare/cbpfc) library for generating eBPF from
@@ -11,24 +12,46 @@ classic BPF. On top of this we use
 filter strings (like you would do when using tcpdump) which it then compiles
 into the BPF instructions that `cbpfc` wants.
 
+The filters of an interface are tried in order and the first one that matches
+a packet decides what happens to it; a packet no filter matches is passed. An
+empty `expr` matches every packet, so a last filter with an empty `expr` sets
+the default action, for example to only let some traffic through:
+```json
+{
+  "interfaces": {
+    "eth0": {
+      "bpf_filters": [
+        {"description": "Allow SSH", "expr": "tcp dst port 22", "action": "pass"},
+        {"description": "Allow DNS replies", "expr": "udp src port 53", "action": "pass"},
+        {"description": "Drop the rest", "expr": "", "action": "drop"}
+      ]
+    }
+  }
+}
+```
+
 A given filter can be applied in a "monitor" mode, and when this is done the
-packets are matched but not dropped, which can be helpful for figuring out the
-impact of adding a given filter.
+matches are counted but the filter does not decide anything: the filters after
+it are still tried, as if it did not match. This can be helpful for figuring
+out the impact of adding a given filter.
 
 The eBPF code is instrumented to call hook maps for
 [xdpcap](https://github.com/cloudflare/xdpcap), so that you can capture pcap of
 matched packets for further analysis. There is one hook per interface for
-dropped packets (`<ifname>-drop`) and one for packets matched by a filter in
-monitor mode (`<ifname>-monitor`), e.g. for eth0:
+packets a filter dropped or passed (`<ifname>-filter`, use `-actions` to pick
+one of them) and one for packets that only matched filters in monitor mode
+(`<ifname>-monitor`), e.g. for eth0:
 ```
-xdpcap /sys/fs/bpf/sunet-xdpd/eth0-drop - "" | tcpdump -nr -
-xdpcap /sys/fs/bpf/sunet-xdpd/eth0-drop - "tcp and port 80" | tcpdump -nr -
-xdpcap /sys/fs/bpf/sunet-xdpd/eth0-drop dropped.pcap "tcp and port 80"
+xdpcap -actions drop /sys/fs/bpf/sunet-xdpd/eth0-filter - "" | tcpdump -nr -
+xdpcap -actions drop /sys/fs/bpf/sunet-xdpd/eth0-filter - "tcp and port 80" | tcpdump -nr -
+xdpcap -actions drop /sys/fs/bpf/sunet-xdpd/eth0-filter dropped.pcap "tcp and port 80"
+xdpcap -actions pass /sys/fs/bpf/sunet-xdpd/eth0-filter - "" | tcpdump -nr -
 xdpcap /sys/fs/bpf/sunet-xdpd/eth0-monitor - "" | tcpdump -nr -
 ```
 
 Matched packets are counted per filter and are visible in prometheus metrics
-available at 127.0.0.1:2112/metrics, e.g.:
+available at 127.0.0.1:2112/metrics, labelled with the interface, description,
+expr, action and whether the filter is in monitor mode, e.g.:
 ```
 curl http://127.0.0.1:2112/metrics | grep ^filter
 ```
@@ -53,12 +76,17 @@ See [conf.d.sample](conf.d.sample) for the file format. The rules are:
   Then reload with `pkill -HUP sunet-xdpd`, once all files of a change are in
   place.
 * A reload is all or nothing: if any file is broken (invalid JSON, an unknown
-  field or one given twice, a missing or empty `expr`, an expression that
-  doesn't compile) nothing changes and the error, naming the file, is logged.
-  A broken file from one writer blocks changes from all of them until it is
-  fixed.
-* Two filters on one interface with the same description, expr and monitor
-  setting are an error, also when they are in different files.
+  field or one given twice, a filter without an `action` or an `expr`, an
+  action other than `drop` or `pass`, an expression that doesn't compile)
+  nothing changes and the error, naming the file, is logged. A broken file
+  from one writer blocks changes from all of them until it is fixed.
+* `action` and `expr` have no defaults, they must be given for every filter.
+  `"expr": ""` is allowed and matches every packet.
+* Two filters on one interface with the same description, expr, action and
+  monitor setting are an error, also when they are in different files.
+* Filters after one with an empty `expr` that is not in monitor mode could
+  never match, so they are an error, also when they are in a later file. Put a
+  default filter in a file that sorts last, like `99-default.json`.
 * Removing a file removes its filters on the next reload. A directory without
   `*.json` files is an error rather than detaching every filter, so to run
   without filters use a file containing `{}`, or `sunet-xdpd -unload`.
